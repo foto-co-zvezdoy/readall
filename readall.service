@@ -1,0 +1,17 @@
+[Unit]
+Description=readall - VPN and proxy collector service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/readall
+EnvironmentFile=-/opt/readall/.env
+ExecStart=/opt/readall/venv/bin/python /opt/readall/app.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
