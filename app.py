@@ -53,6 +53,13 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 
+try:
+    from aiohttp_socks import ProxyConnector as _SocksConnector
+    HAS_SOCKS = True
+except ImportError:
+    _SocksConnector = None
+    HAS_SOCKS = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -80,6 +87,15 @@ SPEED_MIN_MBPS = float(os.environ.get("SPEED_MIN_MBPS", "5"))
 SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=2000000"
 SPEED_TEST_TIMEOUT = 15
 SPEED_CONCURRENCY = 4
+
+# Реальный замер скорости прокси: скачивание 1 МБ через прокси.
+# Прокси медленнее порога вылетают из списков (пинг этого не показывает:
+# порт может отвечать, а трафик через него не идти или ползти).
+PROXY_SPEED_MIN_MBPS = float(os.environ.get("PROXY_SPEED_MIN_MBPS", "2"))
+PROXY_SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
+PROXY_SPEED_TIMEOUT = 15
+PROXY_SPEED_CONCURRENCY = 25
+PROXY_PING_POOL = 400
 
 BLACKLIST = {"RU", "UA", "CN", "IR", "BY", "KZ", "UZ", "AM", "AZ", "KG", "TJ", "MD"}
 MAIN_COUNTRIES = ["FI", "US", "DE", "PL"]
@@ -987,6 +1003,56 @@ async def check_socks5_proxy(proxy: str):
         return None
 
 
+async def speed_test_http_proxy(session: aiohttp.ClientSession, proxy: str):
+    """Скачать 1 МБ через HTTP-прокси. Вернуть Мбит/с или None."""
+    proxy_url = f"http://{proxy}"
+    start = time.monotonic()
+    try:
+        async with session.get(
+            PROXY_SPEED_TEST_URL, proxy=proxy_url,
+            timeout=aiohttp.ClientTimeout(total=PROXY_SPEED_TIMEOUT),
+        ) as r:
+            if r.status != 200:
+                return None
+            n = 0
+            async for chunk in r.content.iter_chunked(65536):
+                n += len(chunk)
+            elapsed = time.monotonic() - start
+            if elapsed <= 0 or n == 0:
+                return None
+            return n * 8 / elapsed / 1e6
+    except Exception:
+        return None
+
+
+async def speed_test_socks5_proxy(proxy: str):
+    """Скачать 1 МБ через SOCKS5-прокси. Вернуть Мбит/с или None."""
+    connector = _SocksConnector.from_url(f"socks5://{proxy}")
+    start = time.monotonic()
+    try:
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=PROXY_SPEED_TIMEOUT),
+        ) as s:
+            async with s.get(PROXY_SPEED_TEST_URL) as r:
+                if r.status != 200:
+                    return None
+                n = 0
+                async for chunk in r.content.iter_chunked(65536):
+                    n += len(chunk)
+                elapsed = time.monotonic() - start
+                if elapsed <= 0 or n == 0:
+                    return None
+                return n * 8 / elapsed / 1e6
+    except Exception:
+        return None
+    finally:
+        try:
+            await connector.close()
+        except Exception:
+            pass
+
+
 async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
     http_candidates: list[str] = []
     socks_candidates: list[str] = []
@@ -1015,7 +1081,7 @@ async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
     socks_candidates = dedup(socks_candidates)[:800]
     log.info("proxy candidates: http=%d socks5=%d", len(http_candidates), len(socks_candidates))
 
-    async def check_and_sort(candidates, checker, name):
+    async def check_and_sort(candidates, checker, speed_checker, name):
         scored: list[tuple[float, str]] = []
         for i in range(0, len(candidates), 50):
             batch = candidates[i : i + 50]
@@ -1023,7 +1089,7 @@ async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
             for p, lat in zip(batch, results):
                 if lat is not None:
                     scored.append((lat, p))
-            if len(scored) >= MAX_PROXY:
+            if len(scored) >= PROXY_PING_POOL:
                 break
             await asyncio.sleep(0.1)
         ips = [p.split(":")[0] for _, p in scored]
@@ -1037,17 +1103,48 @@ async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
                 continue
             filtered.append((lat, p))
         filtered.sort(key=lambda t: t[0])
-        log.info("%s: ok=%d, blacklist dropped=%d", name, len(filtered), dropped)
-        return [p for _, p in filtered[:MAX_PROXY]]
+        log.info("%s: ping ok=%d, blacklist dropped=%d", name, len(filtered), dropped)
+        if speed_checker is None:
+            log.warning("%s: speed test unavailable, keeping ping-only results", name)
+            return [p for _, p in filtered[:MAX_PROXY]]
+        # Реальный замер скорости: скачивание 1 МБ через прокси.
+        # Идём по пингу от быстрых к медленным, останавливаемся,
+        # когда набрали MAX_PROXY прокси быстрее порога.
+        sem = asyncio.Semaphore(PROXY_SPEED_CONCURRENCY)
+        fast: list[tuple[float, str]] = []
+        slow_dropped = 0
+        tested = 0
+
+        async def _test(lat_p):
+            lat, p = lat_p
+            async with sem:
+                return lat, p, await speed_checker(p)
+
+        for i in range(0, len(filtered), PROXY_SPEED_CONCURRENCY):
+            batch = filtered[i : i + PROXY_SPEED_CONCURRENCY]
+            results = await asyncio.gather(*[_test(lp) for lp in batch])
+            tested += len(batch)
+            for lat, p, mbps in results:
+                if mbps is not None and mbps >= PROXY_SPEED_MIN_MBPS:
+                    fast.append((lat, p))
+                else:
+                    slow_dropped += 1
+            if len(fast) >= MAX_PROXY:
+                break
+        log.info("%s: speed tested=%d, fast(>=%.0f Mbit/s)=%d, slow dropped=%d",
+                 name, tested, PROXY_SPEED_MIN_MBPS, len(fast), slow_dropped)
+        return [p for _, p in fast[:MAX_PROXY]]
 
     good_http = await check_and_sort(
         http_candidates,
         lambda p: check_http_proxy(session, p),
+        lambda p: speed_test_http_proxy(session, p),
         "http",
     )
     good_socks = await check_and_sort(
         socks_candidates,
         check_socks5_proxy,
+        speed_test_socks5_proxy if HAS_SOCKS else None,
         "socks5",
     )
     log.info("proxies ok: http=%d socks5=%d", len(good_http), len(good_socks))
