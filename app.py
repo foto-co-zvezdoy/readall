@@ -93,7 +93,9 @@ SPEED_CONCURRENCY = 4
 # порт может отвечать, а трафик через него не идти или ползти).
 PROXY_SPEED_MIN_MBPS = float(os.environ.get("PROXY_SPEED_MIN_MBPS", "2"))
 PROXY_SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
-PROXY_SPEED_TIMEOUT = 15
+# Таймаут 30 с: прокси на пороге 0,5 Мбит/с качает 1 МБ за ~16 с,
+# при таймауте 15 с он бы не успел и вылетел бы по таймауту.
+PROXY_SPEED_TIMEOUT = int(os.environ.get("PROXY_SPEED_TIMEOUT", "30"))
 PROXY_SPEED_CONCURRENCY = 25
 PROXY_PING_POOL = 400
 
@@ -1131,7 +1133,7 @@ async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
                     slow_dropped += 1
             if len(fast) >= MAX_PROXY:
                 break
-        log.info("%s: speed tested=%d, fast(>=%.0f Mbit/s)=%d, slow dropped=%d",
+        log.info("%s: speed tested=%d, fast(>=%.1f Mbit/s)=%d, slow dropped=%d",
                  name, tested, PROXY_SPEED_MIN_MBPS, len(fast), slow_dropped)
         return [p for _, p in fast[:MAX_PROXY]]
 
