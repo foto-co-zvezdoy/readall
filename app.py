@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """readall — автономный сервис сбора, валидации и публикации сетевых конфигураций.
 
-Модуль 1: VPN для приложения (VLESS / VMess / Shadowsocks)
-  - сбор из открытых raw-списков на GitHub (без Telegram)
-  - проверка TCP + TLS handshake, таймаут 3 с, замер задержки
-  - Sticky Pool: узел выбывает только после 2 неудач подряд
-  - экспорт base64-подписки для Hiddify / Nekobox
+Модуль 1: VPN строго VLESS (vless://), приоритет Reality/TLS.
+  - SS (ss://) и VMess (vmess://) полностью исключены.
+  - Динамический поиск свежих списков через GitHub Search API
+    (запросы vless subscription / free vless / vless raw) + живые
+    агрегаторы без Telegram. Мёртвые источники (404/502, 0 VLESS)
+    автоматически отбрасываются.
+  - Проверка TCP + TLS/Reality handshake, таймаут 3 с, замер задержки.
+  - Sticky Pool: узел выбывает только после 2 неудач подряд.
+  - Экспорт base64-подписки только из VLESS для Hiddify / Nekobox.
 
 Модуль 2: Прокси для скриптов (HTTP / SOCKS5)
   - парсинг открытых прокси без авторизации
@@ -14,6 +18,8 @@
 
 Публикация: файлы в OUTPUT_DIR, при наличии GITHUB_TOKEN — коммиты
 в foto-co-zvezdoy/readall через GitHub Contents API.
+Токен берётся из окружения /opt/readall/.env (GITHUB_TOKEN),
+git remote для пуша не используется.
 """
 import asyncio
 import base64
@@ -25,7 +31,7 @@ import ssl
 import sys
 import time
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, urlparse
 
 import aiohttp
 
@@ -45,13 +51,18 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "foto-co-zvezdoy/readall")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
-VPN_SOURCES = [
-    "https://raw.githubusercontent.com/yebekhe/TelegramV2rayCollector/main/sub/mix",
-    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
-    "https://raw.githubusercontent.com/soroushmirzaei/telegram-configs-collector/main/subscriptions/mixed",
-    "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/sub/sub_merge.txt",
-    "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
-    "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2",
+# Только проверенные живые seed-источники (проверено 2026-11-06:
+# ALIILAPRO — 458 VLESS, Pawdroid — 15 VLESS).
+# Всё остальное находится динамически через GitHub Search.
+SEED_VLESS_SOURCES = [
+    "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
+    "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
+]
+
+GITHUB_SEARCH_QUERIES = [
+    "vless subscription",
+    "free vless",
+    "vless raw",
 ]
 
 HTTP_PROXY_SOURCES = [
@@ -82,11 +93,11 @@ def b64_decode_safe(s: str) -> str:
 
 
 def parse_vpn_links(text: str) -> list[str]:
+    """Только vless://. ss://, vmess://, trojan:// отбрасываются."""
     out: list[str] = []
     text = text.strip()
     if not text:
         return out
-    # whole file may be base64 subscription
     if "://" not in text:
         decoded = b64_decode_safe(text)
         if decoded:
@@ -95,14 +106,12 @@ def parse_vpn_links(text: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
-        # line itself may be base64-encoded vmess/vless
-        if line.startswith(("vless://", "vmess://", "ss://", "trojan://")):
+        if line.startswith("vless://"):
             out.append(line)
         elif len(line) > 20 and "://" not in line:
             decoded = b64_decode_safe(line)
-            if decoded.startswith(("vless://", "vmess://", "ss://")):
+            if decoded.startswith("vless://"):
                 out.append(decoded.strip())
-    # dedup, preserve order
     seen, uniq = set(), []
     for x in out:
         if x not in seen:
@@ -111,52 +120,45 @@ def parse_vpn_links(text: str) -> list[str]:
     return uniq
 
 
+def vless_priority(link: str) -> int:
+    """2 — Reality, 1 — TLS, 0 — без шифрования."""
+    low = link.lower()
+    if "reality" in low:
+        return 2
+    if "security=tls" in low or "tls" in low:
+        return 1
+    return 0
+
+
 def parse_host_port(link: str):
-    """Return (host, port, use_tls) or None."""
+    """VLESS only. Return (host, port, use_tls, sni) or None."""
     try:
-        if link.startswith("vmess://"):
-            payload = b64_decode_safe(link[8:])
-            data = json.loads(payload)
-            host = data.get("add") or data.get("address")
-            port = int(data.get("port") or 0)
-            tls = str(data.get("tls", "")).lower() in ("tls", "true", "1")
-            return (host, port, tls) if host and port else None
-        if link.startswith("ss://"):
-            rest = link[5:]
-            # ss://base64(method:pass@host:port)#name  or ss://base64@host:port
-            if "@" in rest:
-                after = rest.split("@", 1)[1]
-                hostport = after.split("#")[0].split("/")[0].split("?")[0]
-                if ":" in hostport:
-                    host, port = hostport.rsplit(":", 1)
-                    return (host, int(port), int(port) == 443)
-            else:
-                decoded = b64_decode_safe(rest.split("#")[0].split("/")[0])
-                if "@" in decoded:
-                    hostport = decoded.split("@", 1)[1].strip()
-                    if ":" in hostport:
-                        host, port = hostport.rsplit(":", 1)
-                        return (host, int(port), int(port) == 443)
-            return None
-        # vless://, trojan://, etc: scheme://uuid@host:port?params#name
         parsed = urlparse(link)
+        if parsed.scheme != "vless":
+            return None
         host = parsed.hostname
         port = parsed.port
         if not host or not port:
             return None
         query = parsed.query.lower()
-        tls = "tls" in query or "security=tls" in query or port == 443
-        return (host, port, tls)
+        # SNI из параметра sni=, иначе host
+        sni = host
+        for part in parsed.query.split("&"):
+            if part.lower().startswith("sni="):
+                sni = part.split("=", 1)[1] or host
+        use_tls = ("security=reality" in query or "security=tls" in query
+                   or "tls" in query or port == 443)
+        return (host, port, use_tls, sni)
     except Exception:
         return None
 
 
 async def check_vpn_node(link: str):
-    """TCP connect + TLS handshake if needed, timeout 3 s. Return latency ms or None."""
+    """TCP + TLS/Reality handshake, таймаут 3 с. Return latency ms or None."""
     parsed = parse_host_port(link)
     if not parsed:
         return None
-    host, port, use_tls = parsed
+    host, port, use_tls, sni = parsed
     start = time.monotonic()
     try:
         if use_tls:
@@ -164,7 +166,7 @@ async def check_vpn_node(link: str):
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, ssl=ctx, server_hostname=host),
+                asyncio.open_connection(host, port, ssl=ctx, server_hostname=sni),
                 timeout=3,
             )
         else:
@@ -194,14 +196,100 @@ async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
         return ""
 
 
+def github_headers():
+    h = {"Accept": "application/vnd.github+json", "User-Agent": "readall-service"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+
+
+async def github_api_get(session: aiohttp.ClientSession, url: str):
+    try:
+        async with session.get(url, headers=github_headers(),
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                log.warning("github api %s -> %s", url, r.status)
+                return None
+            return await r.json()
+    except Exception as e:
+        log.warning("github api %s failed: %s", url, e)
+        return None
+
+
+async def discover_vless_sources(session: aiohttp.ClientSession) -> list[str]:
+    """Динамический поиск VLESS-списков через GitHub Search API.
+
+    Ищет репозитории по запросам, затем через Contents API находит
+    .txt-файлы в корне и проверяет, есть ли в них vless://.
+    Мёртвые (404/502, 0 VLESS) отбрасываются сразу.
+    """
+    found_urls: list[str] = []
+    repos: list[str] = []
+    for q in GITHUB_SEARCH_QUERIES:
+        data = await github_api_get(
+            session,
+            f"https://api.github.com/search/repositories?q={quote(q)}&sort=updated&per_page=10",
+        )
+        if not data:
+            continue
+        for item in data.get("items", []) or []:
+            name = item.get("full_name")
+            if name and name not in repos:
+                repos.append(name)
+    log.info("github search found %d repos", len(repos))
+    # Ограничиваемся первыми 12 репозиториями, чтобы не упираться в rate limit
+    for repo in repos[:12]:
+        contents = await github_api_get(
+            session, f"https://api.github.com/repos/{repo}/contents/"
+        )
+        if not contents or not isinstance(contents, list):
+            continue
+        candidates = []
+        for entry in contents:
+            if entry.get("type") != "file":
+                continue
+            name = entry.get("name", "")
+            if name.lower().endswith((".txt", ".sub")) or name.lower() in ("sub", "vless"):
+                dl = entry.get("download_url")
+                if dl:
+                    candidates.append(dl)
+        # также пробуем стандартные пути
+        for path in ("sub", "sub.txt", "vless.txt", "vless"):
+            candidates.append(f"https://raw.githubusercontent.com/{repo}/main/{path}")
+            candidates.append(f"https://raw.githubusercontent.com/{repo}/master/{path}")
+        for url in candidates:
+            if url in found_urls:
+                continue
+            text = await fetch_text(session, url)
+            if not text:
+                continue
+            links = parse_vpn_links(text)
+            if len(links) >= 3:
+                log.info("discovered vless source %s: %d vless", url, len(links))
+                found_urls.append(url)
+            # не тратим время на остальные файлы этого репо, если уже нашли живой
+            if len(found_urls) >= 10:
+                break
+        if len(found_urls) >= 10:
+            break
+    return found_urls
+
+
 def load_state():
     try:
         data = json.loads(STATE_FILE.read_text())
-        if isinstance(data, dict) and isinstance(data.get("active"), list):
+        if isinstance(data, dict):
+            # Фильтр протокола: старые ss/vmess/trojan узлы выбрасываются
+            active = [x for x in data.get("active", []) if isinstance(x, str) and x.startswith("vless://")]
+            if len(active) != len(data.get("active", [])):
+                log.info("state filtered to vless only: %d kept", len(active))
+            data["active"] = active
+            data.setdefault("fails", {})
+            data.setdefault("sources", {})
             return data
     except Exception:
         pass
-    return {"active": [], "fails": {}}
+    return {"active": [], "fails": {}, "sources": {}}
 
 
 def save_state(state):
@@ -213,68 +301,93 @@ def save_state(state):
 
 
 async def collect_vpn(session: aiohttp.ClientSession):
-    """Sticky Pool: active nodes are checked first, removed only after 2 consecutive failures."""
+    """Sticky Pool, только VLESS, приоритет Reality/TLS."""
     state = load_state()
     active: list[str] = list(state.get("active", []))
     fails: dict[str, int] = dict(state.get("fails", {}))
+    source_state: dict[str, dict] = dict(state.get("sources", {}))
 
-    # 1) fetch candidates
+    # 1) динамический поиск + seed
+    discovered = await discover_vless_sources(session)
+    all_sources = list(SEED_VLESS_SOURCES)
+    for u in discovered:
+        if u not in all_sources:
+            all_sources.append(u)
+    log.info("vpn sources (seed+discovered): %d", len(all_sources))
+
+    # 2) fetch candidates, отбрасывая мёртвые источники
     candidates: list[str] = []
-    for url in VPN_SOURCES:
+    live_sources: list[str] = []
+    for url in all_sources:
         text = await fetch_text(session, url)
-        if text:
-            found = parse_vpn_links(text)
-            log.info("vpn source %s: %d links", url, len(found))
-            candidates.extend(found)
-    # dedup candidates, preserve order
+        if not text:
+            source_state[url] = {"fails": source_state.get(url, {}).get("fails", 0) + 1}
+            continue
+        found = parse_vpn_links(text)
+        if not found:
+            log.info("vpn source %s: 0 vless, dropped", url)
+            source_state[url] = {"fails": source_state.get(url, {}).get("fails", 0) + 1}
+            continue
+        source_state[url] = {"fails": 0}
+        live_sources.append(url)
+        log.info("vpn source %s: %d vless", url, len(found))
+        candidates.extend(found)
+    # источники с 2+ неудачами подряд удаляются из памяти
+    source_state = {k: v for k, v in source_state.items() if v.get("fails", 0) < 2}
     seen, uniq = set(), []
     for x in candidates:
         if x not in seen:
             seen.add(x)
             uniq.append(x)
     candidates = uniq
-    log.info("vpn candidates total: %d", len(candidates))
+    log.info("vpn candidates total (vless only): %d from %d live sources", len(candidates), len(live_sources))
 
-    # 2) check active pool first (sticky)
-    kept: list[tuple[float, str]] = []
+    # 3) check active pool first (sticky)
+    kept: list[tuple[int, float, str]] = []  # (priority, latency, link)
     if active:
         results = await asyncio.gather(*[check_vpn_node(x) for x in active])
         for link, lat in zip(active, results):
             if lat is not None:
                 fails[link] = 0
-                kept.append((lat, link))
+                kept.append((vless_priority(link), lat, link))
             else:
                 fails[link] = fails.get(link, 0) + 1
                 if fails[link] < 2:
-                    # keep for one more chance, but mark as slow (put at end)
                     log.info("vpn sticky keep (fail %d/2): %s", fails[link], link[:60])
-                    kept.append((9999.0, link))
+                    kept.append((vless_priority(link), 9999.0, link))
                 else:
                     log.info("vpn drop after 2 fails: %s", link[:60])
                     fails.pop(link, None)
         log.info("vpn sticky kept: %d / %d", len(kept), len(active))
 
-    # 3) fill pool with fresh candidates that pass
-    kept_links = {x for _, x in kept}
-    need = MAX_VPN - len(kept)
-    if need > 0:
-        fresh = [x for x in candidates if x not in kept_links][:400]
-        # check in batches to avoid too many concurrent connections
-        for i in range(0, len(fresh), 50):
-            batch = fresh[i : i + 50]
-            results = await asyncio.gather(*[check_vpn_node(x) for x in batch])
-            for link, lat in zip(batch, results):
-                if lat is not None and len(kept) < MAX_VPN:
-                    kept.append((lat, link))
-                    fails[link] = 0
-            if len(kept) >= MAX_VPN:
-                break
-            await asyncio.sleep(0.2)
+    # 4) fill pool with fresh candidates that pass, Reality/TLS first
+    kept_links = {x for _, _, x in kept}
+    fresh = [x for x in candidates if x not in kept_links]
+    # сортируем кандидатов: сначала Reality/TLS
+    fresh.sort(key=lambda x: -vless_priority(x))
+    fresh = fresh[:500]
+    for i in range(0, len(fresh), 50):
+        if len(kept) >= MAX_VPN:
+            break
+        batch = fresh[i : i + 50]
+        results = await asyncio.gather(*[check_vpn_node(x) for x in batch])
+        for link, lat in zip(batch, results):
+            if lat is not None and len(kept) < MAX_VPN:
+                kept.append((vless_priority(link), lat, link))
+                fails[link] = 0
+        await asyncio.sleep(0.2)
 
-    kept.sort(key=lambda t: t[0])
-    final = [x for _, x in kept[:MAX_VPN]]
-    save_state({"active": final, "fails": {k: v for k, v in fails.items() if k in final}})
-    log.info("vpn final pool: %d nodes", len(final))
+    # сортировка: приоритет Reality/TLS, затем задержка
+    kept.sort(key=lambda t: (-t[0], t[1]))
+    final = [x for _, _, x in kept[:MAX_VPN]]
+    save_state({
+        "active": final,
+        "fails": {k: v for k, v in fails.items() if k in final},
+        "sources": source_state,
+    })
+    n_reality = sum(1 for x in final if vless_priority(x) == 2)
+    n_tls = sum(1 for x in final if vless_priority(x) == 1)
+    log.info("vpn final pool: %d vless (reality=%d tls=%d plain=%d)", len(final), n_reality, n_tls, len(final) - n_reality - n_tls)
     return final
 
 
@@ -284,14 +397,12 @@ def parse_proxies(text: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
-        # handle "ip:port" or "ip,port" or JSON-ish
         m = IP_PORT_RE.match(line)
         if m:
             port = int(m.group(2))
             if 1 <= port <= 65535:
                 out.append(f"{m.group(1)}:{port}")
             continue
-        # try to find ip:port inside line
         found = re.findall(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})", line)
         for ip, port in found:
             p = int(port)
@@ -334,7 +445,6 @@ async def check_socks5_proxy(proxy: str) -> bool:
             resp = await asyncio.wait_for(reader.readexactly(2), timeout=5)
             if resp != b"\x05\x00":
                 return False
-            # CONNECT 1.1.1.1:80
             writer.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x50")
             await writer.drain()
             resp2 = await asyncio.wait_for(reader.readexactly(10), timeout=5)
@@ -365,7 +475,6 @@ async def collect_proxies(session: aiohttp.ClientSession):
             log.info("socks5 proxy source %s: %d", url, len(found))
             socks_candidates.extend(found)
 
-    # dedup
     def dedup(xs):
         seen, out = set(), []
         for x in xs:
@@ -378,7 +487,6 @@ async def collect_proxies(session: aiohttp.ClientSession):
     socks_candidates = dedup(socks_candidates)[:800]
     log.info("proxy candidates: http=%d socks5=%d", len(http_candidates), len(socks_candidates))
 
-    # check http in batches
     good_http: list[str] = []
     for i in range(0, len(http_candidates), 50):
         batch = http_candidates[i : i + 50]
@@ -454,14 +562,13 @@ async def run_cycle():
         sub_b64 = base64.b64encode("\n".join(vpn).encode()).decode()
         (OUTPUT_DIR / "subscription.txt").write_text(sub_b64)
         (OUTPUT_DIR / "subscription_raw.txt").write_text("\n".join(vpn) + "\n" if vpn else "")
-        log.info("wrote subscription.txt: %d nodes, %d bytes b64", len(vpn), len(sub_b64))
+        log.info("wrote subscription.txt: %d vless nodes, %d bytes b64", len(vpn), len(sub_b64))
 
         http_p, socks_p = await collect_proxies(session)
         (OUTPUT_DIR / "http_proxies.txt").write_text("\n".join(http_p) + "\n" if http_p else "")
         (OUTPUT_DIR / "socks5_proxies.txt").write_text("\n".join(socks_p) + "\n" if socks_p else "")
         log.info("wrote http_proxies.txt=%d socks5_proxies.txt=%d", len(http_p), len(socks_p))
 
-        # publish to GitHub if token present
         if GITHUB_TOKEN:
             ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
             await github_put_file(session, "subscription.txt", sub_b64.encode(), f"Update subscription {ts}")

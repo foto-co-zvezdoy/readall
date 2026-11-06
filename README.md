@@ -4,11 +4,15 @@
 
 ## Что делает
 
-**Модуль 1 — VPN для приложения (VLESS / VMess / Shadowsocks)**
-- Сбор свежих публичных ссылок из открытых raw-списков на GitHub (без Telegram).
-- Проверка: TCP-подключение + TLS-handshake, таймаут 3 с, замер задержки.
+**Модуль 1 — VPN строго VLESS (vless://)**
+- Только VLESS. Shadowsocks (ss://) и VMess (vmess://) полностью исключены.
+- Приоритет Reality/TLS.
+- Динамический поиск свежих списков через GitHub Search API
+  (vless subscription / free vless / vless raw) + живые агрегаторы без Telegram.
+  Мёртвые источники (404/502, 0 VLESS) автоматически отбрасываются.
+- Проверка: TCP-подключение + TLS/Reality-handshake, таймаут 3 с, замер задержки.
 - Sticky Pool: активный пул фиксируется, узел выбывает только после 2 неудач подряд.
-- Экспорт: `subscription.txt` — base64-подписка для Hiddify / Nekobox.
+- Экспорт: `subscription.txt` — base64-подписка только из VLESS для Hiddify / Nekobox.
 
 **Модуль 2 — Прокси для скриптов (HTTP / SOCKS5)**
 - Парсинг открытых прокси без авторизации.
