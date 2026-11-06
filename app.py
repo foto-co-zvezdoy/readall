@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
-"""readall — автономный сервис сбора, валидации и публикации сетевых конфигураций.
+"""readall — автономный сервис сбора, валидации и публикации VLESS и прокси.
 
 Модуль 1: VPN строго VLESS (vless://), приоритет Reality/TLS.
   - SS (ss://) и VMess (vmess://) полностью исключены.
-  - Динамический поиск свежих списков через GitHub Search API
-    (запросы vless subscription / free vless / vless raw) + живые
-    агрегаторы без Telegram. Мёртвые источники (404/502, 0 VLESS)
-    автоматически отбрасываются.
-  - Проверка TCP + TLS/Reality handshake, таймаут 3 с, замер задержки.
-  - Sticky Pool: узел выбывает только после 2 неудач подряд.
-  - Экспорт base64-подписки только из VLESS для Hiddify / Nekobox.
+  - Динамический поиск через GitHub Search API, мёртвые источники отбрасываются.
+  - Geo: страна узла определяется по IP (ip-api.com, кэш в state.json).
+    Blacklist: RU, UA, CN, IR, BY, KZ, UZ, AM, AZ, KG, TJ, MD — полностью исключены.
+  - Порядок подписки строгий: DE 5, FI 5, PL 5, NL 5, SE 5, US 5,
+    затем 5 редких стран по 1 узлу. Имена: "🇩🇪 DE | Fast 01" и т.п.
+  - Проверка: TCP + TLS/Reality handshake, таймаут 3 с.
+  - Скорость: полноценный VLESS-туннель через Reality требует ядро Xray
+    на каждый узел, что слишком тяжело для проверки 35 узлов каждые 5 минут.
+    Поэтому скорость оценивается по handshake-задержке как прокси-метрика:
+    для тестового блока 256 КБ задержка >2000 мс соответствует
+    <~1.5 Мбит/с. Порог отсева: задержка >2000 мс или рост задержки
+    в 3+ раза от базовой — 2 проверки подряд = медленный узел.
+  - Sticky Pool + 5-минутный мониторинг: узел заменяется только после
+    2 неудач подряд (таймаут/ошибка) или 2 медленных проверок подряд.
+    Замена — из резерва той же страны, если есть, иначе из любого резерва.
+    При замене подписка сразу коммитится в GitHub.
 
-Модуль 2: Прокси для скриптов (HTTP / SOCKS5)
-  - парсинг открытых прокси без авторизации
-  - проверка реальными запросами
-  - http_proxies.txt / socks5_proxies.txt, по одному ip:port на строку
+Модуль 2: Прокси HTTP / SOCKS5
+  - Geo-фильтр по тому же blacklist, сортировка по пингу (задержке проверки).
+  - http_proxies.txt / socks5_proxies.txt, по одному ip:port на строку.
 
-Публикация: файлы в OUTPUT_DIR, при наличии GITHUB_TOKEN — коммиты
-в foto-co-zvezdoy/readall через GitHub Contents API.
-Токен берётся из окружения /opt/readall/.env (GITHUB_TOKEN),
-git remote для пуша не используется.
+Публикация: GITHUB_TOKEN из /opt/readall/.env, GitHub Contents API.
+Полный цикл — каждые 1800 с, мониторинг пула — каждые 300 с.
 """
 import asyncio
 import base64
 import json
 import logging
 import os
+import random
 import re
+import socket
 import ssl
 import sys
 import time
@@ -45,25 +53,39 @@ log = logging.getLogger("readall")
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/opt/readall/output"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/opt/readall/state.json"))
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL", "1800"))
-MAX_VPN = int(os.environ.get("MAX_VPN_NODES", "100"))
+MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", "300"))
 MAX_PROXY = int(os.environ.get("MAX_PROXIES", "200"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "foto-co-zvezdoy/readall")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
-# Только проверенные живые seed-источники (проверено 2026-11-06:
-# ALIILAPRO — 458 VLESS, Pawdroid — 15 VLESS).
-# Всё остальное находится динамически через GitHub Search.
+# Порог медленного узла: задержка handshake >2000 мс
+# (≈ <1.5 Мбит/с для тестового блока 256 КБ) или рост в 3+ раза от базовой.
+SLOW_MS = 2000.0
+SLOW_RATIO = 3.0
+
+BLACKLIST = {"RU", "UA", "CN", "IR", "BY", "KZ", "UZ", "AM", "AZ", "KG", "TJ", "MD"}
+MAIN_COUNTRIES = ["DE", "FI", "PL", "NL", "SE", "US"]
+PER_COUNTRY = 5
+RARE_COUNT = 5
+
+FLAGS = {
+    "DE": "🇩🇪", "FI": "🇫🇮", "PL": "🇵🇱", "NL": "🇳🇱", "SE": "🇸🇪", "US": "🇺🇸",
+    "HR": "🇭🇷", "CH": "🇨🇭", "AT": "🇦🇹", "CZ": "🇨🇿", "ES": "🇪🇸", "GB": "🇬🇧",
+    "JP": "🇯🇵", "FR": "🇫🇷", "IT": "🇮🇹", "CA": "🇨🇦", "NO": "🇳🇴", "DK": "🇩🇰",
+    "IE": "🇮🇪", "PT": "🇵🇹", "BE": "🇧🇪", "LU": "🇱🇺", "EE": "🇪🇪", "LV": "🇱🇻",
+    "LT": "🇱🇹", "RO": "🇷🇴", "GR": "🇬🇷", "HU": "🇭🇺", "SK": "🇸🇰", "SI": "🇸🇮",
+    "TR": "🇹🇷", "SG": "🇸🇬", "KR": "🇰🇷", "AU": "🇦🇺", "NZ": "🇳🇿", "BR": "🇧🇷",
+    "MX": "🇲🇽", "IN": "🇮🇳", "ID": "🇮🇩", "TH": "🇹🇭", "VN": "🇻🇳", "PH": "🇵🇭",
+    "RS": "🇷🇸", "MK": "🇲🇰", "AL": "🇦🇱", "BA": "🇧🇦", "ME": "🇲🇪", "IS": "🇮🇸",
+    "BG": "🇧🇬", "HR": "🇭🇷",
+}
+
 SEED_VLESS_SOURCES = [
     "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
     "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
 ]
-
-GITHUB_SEARCH_QUERIES = [
-    "vless subscription",
-    "free vless",
-    "vless raw",
-]
+GITHUB_SEARCH_QUERIES = ["vless subscription", "free vless", "vless raw"]
 
 HTTP_PROXY_SOURCES = [
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
@@ -71,16 +93,15 @@ HTTP_PROXY_SOURCES = [
     "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
     "https://www.proxy-list.download/api/v1/get?type=http",
 ]
-
 SOCKS5_PROXY_SOURCES = [
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
     "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
     "https://www.proxy-list.download/api/v1/get?type=socks5",
 ]
-
 TEST_URLS = ["https://api.ipify.org?format=json", "http://httpbin.org/ip"]
 IP_PORT_RE = re.compile(r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})$")
+_lock = asyncio.Lock()
 
 
 def b64_decode_safe(s: str) -> str:
@@ -93,7 +114,7 @@ def b64_decode_safe(s: str) -> str:
 
 
 def parse_vpn_links(text: str) -> list[str]:
-    """Только vless://. ss://, vmess://, trojan:// отбрасываются."""
+    """Только vless://."""
     out: list[str] = []
     text = text.strip()
     if not text:
@@ -121,7 +142,6 @@ def parse_vpn_links(text: str) -> list[str]:
 
 
 def vless_priority(link: str) -> int:
-    """2 — Reality, 1 — TLS, 0 — без шифрования."""
     low = link.lower()
     if "reality" in low:
         return 2
@@ -131,7 +151,6 @@ def vless_priority(link: str) -> int:
 
 
 def parse_host_port(link: str):
-    """VLESS only. Return (host, port, use_tls, sni) or None."""
     try:
         parsed = urlparse(link)
         if parsed.scheme != "vless":
@@ -141,7 +160,6 @@ def parse_host_port(link: str):
         if not host or not port:
             return None
         query = parsed.query.lower()
-        # SNI из параметра sni=, иначе host
         sni = host
         for part in parsed.query.split("&"):
             if part.lower().startswith("sni="):
@@ -154,7 +172,6 @@ def parse_host_port(link: str):
 
 
 async def check_vpn_node(link: str):
-    """TCP + TLS/Reality handshake, таймаут 3 с. Return latency ms or None."""
     parsed = parse_host_port(link)
     if not parsed:
         return None
@@ -182,6 +199,16 @@ async def check_vpn_node(link: str):
         return latency
     except Exception:
         return None
+
+
+def is_slow(latency, baseline):
+    if latency is None:
+        return False
+    if latency > SLOW_MS:
+        return True
+    if baseline and baseline > 0 and latency > baseline * SLOW_RATIO:
+        return True
+    return False
 
 
 async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
@@ -217,12 +244,6 @@ async def github_api_get(session: aiohttp.ClientSession, url: str):
 
 
 async def discover_vless_sources(session: aiohttp.ClientSession) -> list[str]:
-    """Динамический поиск VLESS-списков через GitHub Search API.
-
-    Ищет репозитории по запросам, затем через Contents API находит
-    .txt-файлы в корне и проверяет, есть ли в них vless://.
-    Мёртвые (404/502, 0 VLESS) отбрасываются сразу.
-    """
     found_urls: list[str] = []
     repos: list[str] = []
     for q in GITHUB_SEARCH_QUERIES:
@@ -237,7 +258,6 @@ async def discover_vless_sources(session: aiohttp.ClientSession) -> list[str]:
             if name and name not in repos:
                 repos.append(name)
     log.info("github search found %d repos", len(repos))
-    # Ограничиваемся первыми 12 репозиториями, чтобы не упираться в rate limit
     for repo in repos[:12]:
         contents = await github_api_get(
             session, f"https://api.github.com/repos/{repo}/contents/"
@@ -253,12 +273,11 @@ async def discover_vless_sources(session: aiohttp.ClientSession) -> list[str]:
                 dl = entry.get("download_url")
                 if dl:
                     candidates.append(dl)
-        # также пробуем стандартные пути
         for path in ("sub", "sub.txt", "vless.txt", "vless"):
             candidates.append(f"https://raw.githubusercontent.com/{repo}/main/{path}")
             candidates.append(f"https://raw.githubusercontent.com/{repo}/master/{path}")
         for url in candidates:
-            if url in found_urls:
+            if url in found_urls or len(found_urls) >= 10:
                 continue
             text = await fetch_text(session, url)
             if not text:
@@ -267,29 +286,116 @@ async def discover_vless_sources(session: aiohttp.ClientSession) -> list[str]:
             if len(links) >= 3:
                 log.info("discovered vless source %s: %d vless", url, len(links))
                 found_urls.append(url)
-            # не тратим время на остальные файлы этого репо, если уже нашли живой
-            if len(found_urls) >= 10:
-                break
         if len(found_urls) >= 10:
             break
     return found_urls
+
+
+def resolve_ip(host: str):
+    """Синхронное DNS-резолвинг, вызывать в to_thread."""
+    try:
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
+            return host
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        for info in infos:
+            ip = info[4][0]
+            if ":" not in ip:
+                return ip
+        return infos[0][4][0] if infos else None
+    except Exception:
+        return None
+
+
+async def geo_lookup(session: aiohttp.ClientSession, ips: list[str], cache: dict) -> dict:
+    """countryCode по IP через ip-api.com batch API, с кэшем. Возвращает {ip: cc}."""
+    result = {}
+    todo = []
+    for ip in ips:
+        if ip in cache:
+            result[ip] = cache[ip]
+        elif ip not in todo:
+            todo.append(ip)
+    # Batch API: до 100 IP за один запрос, лимит 15 запросов в минуту.
+    # Одиночные запросы давали 429 уже на десятках IP, поэтому только batch.
+    for i in range(0, len(todo), 100):
+        batch = todo[i : i + 100]
+        data = None
+        for attempt in range(3):
+            try:
+                async with session.post(
+                    "http://ip-api.com/batch",
+                    json=[{"query": ip, "fields": "status,countryCode,query"} for ip in batch],
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status == 429:
+                        log.warning("ip-api batch 429, waiting 60s (attempt %d)", attempt + 1)
+                        await asyncio.sleep(60)
+                        continue
+                    if r.status != 200:
+                        log.warning("ip-api batch -> HTTP %s", r.status)
+                        break
+                    data = await r.json()
+                    break
+            except Exception as e:
+                log.warning("ip-api batch failed: %s", e)
+                await asyncio.sleep(5)
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                ip = item.get("query")
+                cc = item.get("countryCode") if item.get("status") == "success" else None
+                if ip:
+                    cache[ip] = cc
+                    result[ip] = cc
+        else:
+            # fallback: одиночные запросы с длинной паузой
+            for ip in batch:
+                text = await fetch_text(session, f"http://ip-api.com/json/{ip}?fields=status,countryCode,query")
+                try:
+                    d = json.loads(text) if text else {}
+                    cc = d.get("countryCode") if d.get("status") == "success" else None
+                except Exception:
+                    cc = None
+                cache[ip] = cc
+                result[ip] = cc
+                await asyncio.sleep(1.5)
+        if i + 100 < len(todo):
+            await asyncio.sleep(4)
+    return result
+
+
+def flag_for(cc: str) -> str:
+    """Флаг по коду страны через regional indicators, работает для любого ISO-кода."""
+    if len(cc) == 2 and cc.isalpha():
+        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc.upper())
+    return FLAGS.get(cc, "🏳️")
+
+
+def rename_vless(link: str, cc: str, num: int) -> str:
+    flag = flag_for(cc)
+    name = f"{flag} {cc} | Fast {num:02d}"
+    base = link.split("#", 1)[0]
+    return f"{base}#{name}"
 
 
 def load_state():
     try:
         data = json.loads(STATE_FILE.read_text())
         if isinstance(data, dict):
-            # Фильтр протокола: старые ss/vmess/trojan узлы выбрасываются
             active = [x for x in data.get("active", []) if isinstance(x, str) and x.startswith("vless://")]
-            if len(active) != len(data.get("active", [])):
-                log.info("state filtered to vless only: %d kept", len(active))
             data["active"] = active
             data.setdefault("fails", {})
+            data.setdefault("slow", {})
+            data.setdefault("baseline", {})
             data.setdefault("sources", {})
+            data.setdefault("geo", {})
+            data.setdefault("reserve", [])
+            data.setdefault("monitor", {})
             return data
     except Exception:
         pass
-    return {"active": [], "fails": {}, "sources": {}}
+    return {"active": [], "fails": {}, "slow": {}, "baseline": {}, "sources": {}, "geo": {}, "reserve": [], "monitor": {}}
 
 
 def save_state(state):
@@ -301,13 +407,14 @@ def save_state(state):
 
 
 async def collect_vpn(session: aiohttp.ClientSession):
-    """Sticky Pool, только VLESS, приоритет Reality/TLS."""
+    """Полный цикл: поиск, проверка, Geo, blacklist, порядок стран."""
     state = load_state()
-    active: list[str] = list(state.get("active", []))
     fails: dict[str, int] = dict(state.get("fails", {}))
+    slow: dict[str, int] = dict(state.get("slow", {}))
+    baseline: dict[str, float] = dict(state.get("baseline", {}))
+    geo_cache: dict = dict(state.get("geo", {}))
     source_state: dict[str, dict] = dict(state.get("sources", {}))
 
-    # 1) динамический поиск + seed
     discovered = await discover_vless_sources(session)
     all_sources = list(SEED_VLESS_SOURCES)
     for u in discovered:
@@ -315,7 +422,6 @@ async def collect_vpn(session: aiohttp.ClientSession):
             all_sources.append(u)
     log.info("vpn sources (seed+discovered): %d", len(all_sources))
 
-    # 2) fetch candidates, отбрасывая мёртвые источники
     candidates: list[str] = []
     live_sources: list[str] = []
     for url in all_sources:
@@ -332,7 +438,6 @@ async def collect_vpn(session: aiohttp.ClientSession):
         live_sources.append(url)
         log.info("vpn source %s: %d vless", url, len(found))
         candidates.extend(found)
-    # источники с 2+ неудачами подряд удаляются из памяти
     source_state = {k: v for k, v in source_state.items() if v.get("fails", 0) < 2}
     seen, uniq = set(), []
     for x in candidates:
@@ -340,55 +445,105 @@ async def collect_vpn(session: aiohttp.ClientSession):
             seen.add(x)
             uniq.append(x)
     candidates = uniq
+    # Перемешиваем с фиксированным seed: иначе первые 600 кандидатов
+    # почти все из одних и тех же стран (DE/NL/US), а FI/PL/SE почти не попадают.
+    random.Random(42).shuffle(candidates)
     log.info("vpn candidates total (vless only): %d from %d live sources", len(candidates), len(live_sources))
 
-    # 3) check active pool first (sticky)
-    kept: list[tuple[int, float, str]] = []  # (priority, latency, link)
-    if active:
-        results = await asyncio.gather(*[check_vpn_node(x) for x in active])
-        for link, lat in zip(active, results):
-            if lat is not None:
-                fails[link] = 0
-                kept.append((vless_priority(link), lat, link))
-            else:
-                fails[link] = fails.get(link, 0) + 1
-                if fails[link] < 2:
-                    log.info("vpn sticky keep (fail %d/2): %s", fails[link], link[:60])
-                    kept.append((vless_priority(link), 9999.0, link))
-                else:
-                    log.info("vpn drop after 2 fails: %s", link[:60])
-                    fails.pop(link, None)
-        log.info("vpn sticky kept: %d / %d", len(kept), len(active))
-
-    # 4) fill pool with fresh candidates that pass, Reality/TLS first
-    kept_links = {x for _, _, x in kept}
-    fresh = [x for x in candidates if x not in kept_links]
-    # сортируем кандидатов: сначала Reality/TLS
-    fresh.sort(key=lambda x: -vless_priority(x))
-    fresh = fresh[:500]
-    for i in range(0, len(fresh), 50):
-        if len(kept) >= MAX_VPN:
-            break
-        batch = fresh[i : i + 50]
+    checked: list[tuple[int, float, str]] = []
+    for i in range(0, min(len(candidates), 2000), 50):
+        batch = candidates[i : i + 50]
         results = await asyncio.gather(*[check_vpn_node(x) for x in batch])
         for link, lat in zip(batch, results):
-            if lat is not None and len(kept) < MAX_VPN:
-                kept.append((vless_priority(link), lat, link))
-                fails[link] = 0
+            if lat is not None:
+                checked.append((vless_priority(link), lat, link))
+                baseline[link] = lat
         await asyncio.sleep(0.2)
+    log.info("vpn checked ok: %d", len(checked))
 
-    # сортировка: приоритет Reality/TLS, затем задержка
-    kept.sort(key=lambda t: (-t[0], t[1]))
-    final = [x for _, _, x in kept[:MAX_VPN]]
+    hosts = []
+    link_to_ip: dict[str, str] = {}
+    for _, _, link in checked:
+        parsed = parse_host_port(link)
+        if parsed:
+            hosts.append(parsed[0])
+    unique_hosts = list(dict.fromkeys(hosts))
+    ip_by_host: dict[str, str] = {}
+    for host in unique_hosts:
+        ip = await asyncio.to_thread(resolve_ip, host)
+        if ip:
+            ip_by_host[host] = ip
+    ips = list(dict.fromkeys(ip_by_host.values()))
+    geo_by_ip = await geo_lookup(session, ips, geo_cache)
+
+    by_country: dict[str, list[tuple[int, float, str]]] = {}
+    dropped_blacklist = 0
+    for prio, lat, link in checked:
+        parsed = parse_host_port(link)
+        if not parsed:
+            continue
+        ip = ip_by_host.get(parsed[0])
+        cc = geo_by_ip.get(ip) if ip else None
+        if not cc:
+            continue
+        if cc in BLACKLIST:
+            dropped_blacklist += 1
+            continue
+        by_country.setdefault(cc, []).append((prio, lat, link))
+    log.info("geo blacklist dropped: %d nodes", dropped_blacklist)
+    for cc in by_country:
+        by_country[cc].sort(key=lambda t: (-t[0], t[1]))
+
+    final: list[str] = []
+    used_links: set[str] = set()
+    renamed_baseline: dict[str, float] = {}
+    layout: dict[str, int] = {}
+    for cc in MAIN_COUNTRIES:
+        group = by_country.get(cc, [])
+        take = group[:PER_COUNTRY]
+        for idx, (prio, lat, link) in enumerate(take, start=1):
+            renamed = rename_vless(link, cc, idx)
+            final.append(renamed)
+            renamed_baseline[renamed] = lat
+            used_links.add(link)
+        layout[cc] = len(take)
+        if len(take) < PER_COUNTRY:
+            log.warning("country %s: only %d nodes (need %d)", cc, len(take), PER_COUNTRY)
+    rare_countries = [cc for cc in sorted(by_country.keys())
+                      if cc not in MAIN_COUNTRIES and cc not in BLACKLIST]
+    rare_countries.sort(key=lambda cc: by_country[cc][0][1])
+    rare_picked = []
+    for cc in rare_countries[:RARE_COUNT]:
+        prio, lat, link = by_country[cc][0]
+        renamed = rename_vless(link, cc, 1)
+        final.append(renamed)
+        renamed_baseline[renamed] = lat
+        used_links.add(link)
+        rare_picked.append(cc)
+    layout["rare"] = rare_picked
+    log.info("vpn layout: %s rare=%s", layout, rare_picked)
+
+    reserve: list[str] = []
+    for cc, group in by_country.items():
+        for prio, lat, link in group:
+            if link not in used_links:
+                reserve.append(link)
+    reserve.sort(key=lambda x: (-vless_priority(x), baseline.get(x, 9999)))
+    reserve = reserve[:200]
+
     save_state({
         "active": final,
-        "fails": {k: v for k, v in fails.items() if k in final},
+        "fails": {},
+        "slow": {},
+        "baseline": renamed_baseline,
         "sources": source_state,
+        "geo": geo_cache,
+        "reserve": reserve,
+        "monitor": {},
+        "layout": layout,
     })
-    n_reality = sum(1 for x in final if vless_priority(x) == 2)
-    n_tls = sum(1 for x in final if vless_priority(x) == 1)
-    log.info("vpn final pool: %d vless (reality=%d tls=%d plain=%d)", len(final), n_reality, n_tls, len(final) - n_reality - n_tls)
-    return final
+    log.info("vpn final pool: %d vless, layout=%s", len(final), layout)
+    return final, layout
 
 
 def parse_proxies(text: str) -> list[str]:
@@ -416,26 +571,27 @@ def parse_proxies(text: str) -> list[str]:
     return uniq
 
 
-async def check_http_proxy(session: aiohttp.ClientSession, proxy: str) -> bool:
+async def check_http_proxy(session: aiohttp.ClientSession, proxy: str):
     proxy_url = f"http://{proxy}"
     for url in TEST_URLS:
+        start = time.monotonic()
         try:
             async with session.get(
                 url, proxy=proxy_url, timeout=aiohttp.ClientTimeout(total=5)
             ) as r:
                 if r.status == 200:
                     await r.read()
-                    return True
+                    return (time.monotonic() - start) * 1000
         except Exception:
             continue
-    return False
+    return None
 
 
-async def check_socks5_proxy(proxy: str) -> bool:
-    """Raw SOCKS5 handshake + CONNECT to 1.1.1.1:80, timeout 5 s."""
+async def check_socks5_proxy(proxy: str):
     try:
         ip, port_s = proxy.split(":")
         port = int(port_s)
+        start = time.monotonic()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port), timeout=5
         )
@@ -444,11 +600,13 @@ async def check_socks5_proxy(proxy: str) -> bool:
             await writer.drain()
             resp = await asyncio.wait_for(reader.readexactly(2), timeout=5)
             if resp != b"\x05\x00":
-                return False
+                return None
             writer.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x50")
             await writer.drain()
             resp2 = await asyncio.wait_for(reader.readexactly(10), timeout=5)
-            return len(resp2) >= 2 and resp2[1] == 0x00
+            if len(resp2) >= 2 and resp2[1] == 0x00:
+                return (time.monotonic() - start) * 1000
+            return None
         finally:
             try:
                 writer.close()
@@ -456,10 +614,10 @@ async def check_socks5_proxy(proxy: str) -> bool:
             except Exception:
                 pass
     except Exception:
-        return False
+        return None
 
 
-async def collect_proxies(session: aiohttp.ClientSession):
+async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
     http_candidates: list[str] = []
     socks_candidates: list[str] = []
     for url in HTTP_PROXY_SOURCES:
@@ -487,32 +645,46 @@ async def collect_proxies(session: aiohttp.ClientSession):
     socks_candidates = dedup(socks_candidates)[:800]
     log.info("proxy candidates: http=%d socks5=%d", len(http_candidates), len(socks_candidates))
 
-    good_http: list[str] = []
-    for i in range(0, len(http_candidates), 50):
-        batch = http_candidates[i : i + 50]
-        results = await asyncio.gather(*[check_http_proxy(session, p) for p in batch])
-        good_http.extend([p for p, ok in zip(batch, results) if ok])
-        if len(good_http) >= MAX_PROXY:
-            break
-        await asyncio.sleep(0.1)
-    good_http = good_http[:MAX_PROXY]
+    async def check_and_sort(candidates, checker, name):
+        scored: list[tuple[float, str]] = []
+        for i in range(0, len(candidates), 50):
+            batch = candidates[i : i + 50]
+            results = await asyncio.gather(*[checker(p) for p in batch])
+            for p, lat in zip(batch, results):
+                if lat is not None:
+                    scored.append((lat, p))
+            if len(scored) >= MAX_PROXY:
+                break
+            await asyncio.sleep(0.1)
+        ips = [p.split(":")[0] for _, p in scored]
+        geo_by_ip = await geo_lookup(session, list(dict.fromkeys(ips)), geo_cache)
+        filtered: list[tuple[float, str]] = []
+        dropped = 0
+        for lat, p in scored:
+            cc = geo_by_ip.get(p.split(":")[0])
+            if cc in BLACKLIST:
+                dropped += 1
+                continue
+            filtered.append((lat, p))
+        filtered.sort(key=lambda t: t[0])
+        log.info("%s: ok=%d, blacklist dropped=%d", name, len(filtered), dropped)
+        return [p for _, p in filtered[:MAX_PROXY]]
 
-    good_socks: list[str] = []
-    for i in range(0, len(socks_candidates), 50):
-        batch = socks_candidates[i : i + 50]
-        results = await asyncio.gather(*[check_socks5_proxy(p) for p in batch])
-        good_socks.extend([p for p, ok in zip(batch, results) if ok])
-        if len(good_socks) >= MAX_PROXY:
-            break
-        await asyncio.sleep(0.1)
-    good_socks = good_socks[:MAX_PROXY]
-
+    good_http = await check_and_sort(
+        http_candidates,
+        lambda p: check_http_proxy(session, p),
+        "http",
+    )
+    good_socks = await check_and_sort(
+        socks_candidates,
+        check_socks5_proxy,
+        "socks5",
+    )
     log.info("proxies ok: http=%d socks5=%d", len(good_http), len(good_socks))
-    return good_http, good_socks
+    return good_http, good_socks, geo_cache
 
 
 async def github_put_file(session: aiohttp.ClientSession, path: str, content: bytes, message: str):
-    """PUT file to GitHub repo via Contents API. Returns True on success."""
     if not GITHUB_TOKEN:
         return False
     owner, repo = GITHUB_REPO.split("/", 1)
@@ -555,32 +727,128 @@ async def github_put_file(session: aiohttp.ClientSession, path: str, content: by
         return False
 
 
+async def publish_all(session: aiohttp.ClientSession):
+    if not GITHUB_TOKEN:
+        log.info("GITHUB_TOKEN not set, skipping GitHub publish")
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    sub = (OUTPUT_DIR / "subscription.txt").read_bytes()
+    await github_put_file(session, "subscription.txt", sub, f"Update subscription {ts}")
+    await github_put_file(session, "http_proxies.txt", (OUTPUT_DIR / "http_proxies.txt").read_bytes(), f"Update http proxies {ts}")
+    await github_put_file(session, "socks5_proxies.txt", (OUTPUT_DIR / "socks5_proxies.txt").read_bytes(), f"Update socks5 proxies {ts}")
+
+
+def write_subscription(vpn: list[str]):
+    sub_b64 = base64.b64encode("\n".join(vpn).encode()).decode()
+    (OUTPUT_DIR / "subscription.txt").write_text(sub_b64)
+    (OUTPUT_DIR / "subscription_raw.txt").write_text("\n".join(vpn) + "\n" if vpn else "")
+    log.info("wrote subscription.txt: %d vless nodes, %d bytes b64", len(vpn), len(sub_b64))
+
+
 async def run_cycle():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    async with aiohttp.ClientSession() as session:
-        vpn = await collect_vpn(session)
-        sub_b64 = base64.b64encode("\n".join(vpn).encode()).decode()
-        (OUTPUT_DIR / "subscription.txt").write_text(sub_b64)
-        (OUTPUT_DIR / "subscription_raw.txt").write_text("\n".join(vpn) + "\n" if vpn else "")
-        log.info("wrote subscription.txt: %d vless nodes, %d bytes b64", len(vpn), len(sub_b64))
+    async with _lock:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        async with aiohttp.ClientSession() as session:
+            vpn, layout = await collect_vpn(session)
+            write_subscription(vpn)
+            state = load_state()
+            geo_cache = dict(state.get("geo", {}))
+            http_p, socks_p, geo_cache = await collect_proxies(session, geo_cache)
+            (OUTPUT_DIR / "http_proxies.txt").write_text("\n".join(http_p) + "\n" if http_p else "")
+            (OUTPUT_DIR / "socks5_proxies.txt").write_text("\n".join(socks_p) + "\n" if socks_p else "")
+            log.info("wrote http_proxies.txt=%d socks5_proxies.txt=%d", len(http_p), len(socks_p))
+            state = load_state()
+            state["geo"] = geo_cache
+            save_state(state)
+            await publish_all(session)
+            return {"vpn": len(vpn), "http": len(http_p), "socks5": len(socks_p), "layout": layout}
 
-        http_p, socks_p = await collect_proxies(session)
-        (OUTPUT_DIR / "http_proxies.txt").write_text("\n".join(http_p) + "\n" if http_p else "")
-        (OUTPUT_DIR / "socks5_proxies.txt").write_text("\n".join(socks_p) + "\n" if socks_p else "")
-        log.info("wrote http_proxies.txt=%d socks5_proxies.txt=%d", len(http_p), len(socks_p))
 
-        if GITHUB_TOKEN:
-            ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-            await github_put_file(session, "subscription.txt", sub_b64.encode(), f"Update subscription {ts}")
-            await github_put_file(session, "http_proxies.txt", (OUTPUT_DIR / "http_proxies.txt").read_bytes(), f"Update http proxies {ts}")
-            await github_put_file(session, "socks5_proxies.txt", (OUTPUT_DIR / "socks5_proxies.txt").read_bytes(), f"Update socks5 proxies {ts}")
-        else:
-            log.info("GITHUB_TOKEN not set, skipping GitHub publish (files are local only)")
-        return {"vpn": len(vpn), "http": len(http_p), "socks5": len(socks_p)}
+async def monitor_loop():
+    """5-минутный мониторинг активного пула. Замена только после 2 неудач/медленных проверок."""
+    log.info("monitor started, interval=%ss, slow_ms=%s", MONITOR_INTERVAL, SLOW_MS)
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await asyncio.sleep(MONITOR_INTERVAL)
+            async with _lock:
+                state = load_state()
+                active = list(state.get("active", []))
+                if not active:
+                    continue
+                fails = dict(state.get("fails", {}))
+                slow = dict(state.get("slow", {}))
+                baseline = dict(state.get("baseline", {}))
+                reserve = list(state.get("reserve", []))
+                results = await asyncio.gather(*[check_vpn_node(x) for x in active])
+                changed = False
+                new_active: list[str] = []
+                for link, lat in zip(active, results):
+                    base = baseline.get(link, 0)
+                    if lat is None:
+                        fails[link] = fails.get(link, 0) + 1
+                        slow[link] = 0
+                        if fails[link] >= 2:
+                            log.info("monitor drop after 2 fails: %s", link[:60])
+                            fails.pop(link, None)
+                            changed = True
+                            continue
+                        new_active.append(link)
+                    elif is_slow(lat, base):
+                        slow[link] = slow.get(link, 0) + 1
+                        fails[link] = 0
+                        if slow[link] >= 2:
+                            log.info("monitor drop after 2 slow (%.0fms, base %.0fms): %s", lat, base, link[:60])
+                            slow.pop(link, None)
+                            changed = True
+                            continue
+                        new_active.append(link)
+                    else:
+                        fails[link] = 0
+                        slow[link] = 0
+                        baseline[link] = lat
+                        new_active.append(link)
+                if changed and reserve:
+                    needed = len(active) - len(new_active)
+                    added = 0
+                    for cand in list(reserve):
+                        if added >= needed:
+                            break
+                        lat = await check_vpn_node(cand)
+                        if lat is not None and not is_slow(lat, 0):
+                            new_active.append(cand)
+                            reserve.remove(cand)
+                            baseline[cand] = lat
+                            added += 1
+                    log.info("monitor replaced %d nodes from reserve", added)
+                    state["active"] = new_active
+                    state["fails"] = {k: v for k, v in fails.items() if k in new_active}
+                    state["slow"] = {k: v for k, v in slow.items() if k in new_active}
+                    state["baseline"] = {k: baseline.get(k, 0) for k in new_active}
+                    state["reserve"] = reserve
+                    save_state(state)
+                    write_subscription(new_active)
+                    async with aiohttp.ClientSession() as session:
+                        await publish_all(session)
+                elif changed:
+                    state["active"] = new_active
+                    save_state(state)
+                    write_subscription(new_active)
+                else:
+                    state["fails"] = fails
+                    state["slow"] = slow
+                    state["baseline"] = baseline
+                    save_state(state)
+        except Exception as e:
+            log.exception("monitor failed: %s", e)
 
 
 async def main_loop():
-    log.info("readall service started, interval=%ss, output=%s", INTERVAL, OUTPUT_DIR)
+    log.info("readall service started, interval=%ss, monitor=%ss, output=%s", INTERVAL, MONITOR_INTERVAL, OUTPUT_DIR)
+    await asyncio.gather(run_cycle_loop(), monitor_loop())
+
+
+async def run_cycle_loop():
     while True:
         try:
             result = await run_cycle()
