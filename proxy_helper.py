@@ -1,4 +1,3 @@
-import random
 import time
 
 import requests
@@ -44,21 +43,15 @@ def check_proxy(proxy, kind="http", timeout=5):
 
 def get_working_proxy(kind="http", tries=10, timeout=5):
     proxies = load_proxies(kind)
-    random.shuffle(proxies)
     for proxy in proxies[:tries]:
         if check_proxy(proxy, kind, timeout):
             return proxy
     raise RuntimeError(f"не нашли рабочий {kind}-прокси за {tries} попыток")
 
 
-def get(url, kind="http", tries=5, timeout=10, **kwargs):
+def get(url, kind="http", tries=10, timeout=10, **kwargs):
     proxies = load_proxies(kind)
-    tried = set()
-    for _ in range(tries):
-        proxy = random.choice(proxies)
-        if proxy in tried:
-            continue
-        tried.add(proxy)
+    for proxy in proxies[:tries]:
         try:
             return requests.get(
                 url, proxies=_proxies_dict(proxy, kind), timeout=timeout, **kwargs
@@ -68,7 +61,7 @@ def get(url, kind="http", tries=5, timeout=10, **kwargs):
     raise RuntimeError(f"все {kind}-прокси отвалились ({tries} попыток)")
 
 
-def session(kind="http", tries=5, timeout=10):
+def session(kind="http", tries=10, timeout=10):
     proxy = get_working_proxy(kind, tries=tries, timeout=timeout)
     s = requests.Session()
     s.proxies.update(_proxies_dict(proxy, kind))
