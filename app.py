@@ -8,13 +8,17 @@
     Blacklist: RU, UA, CN, IR, BY, KZ, UZ, AM, AZ, KG, TJ, MD — полностью исключены.
   - Порядок подписки строгий: DE 6, FI 6, PL 6, NL 6, SE 6, US 6,
     затем 6 редких стран по 1 узлу (всего 42). Имена: "🇩🇪 DE | Fast 01" и т.п.
+  - Ровно 6 на страну, не больше не меньше: если после первого прохода
+    проверки какая-то страна не набрала 6, проверяются остальные кандидаты,
+    а если и этого мало — добирается из прошлого пула (рабочие узлы той же
+    страны). Публикуется всегда полный набор 42 узла.
   - Редкие страны — случайные, меняются ровно раз в сутки (seed = дата UTC,
     хранится в state.json как rare_date/rare_countries). Если редкая страна
     перестаёт отвечать (монитор, 2 проверки подряд), она заменяется на
     другую случайную страну сразу, не дожидаясь суток.
   - Проверка: TCP + TLS/Reality handshake, таймаут 3 с.
   - Скорость: полноценный VLESS-туннель через Reality требует ядро Xray
-    на каждый узел, что слишком тяжело для проверки 35 узлов каждые 5 минут.
+    на каждый узел, что слишком тяжело для проверки 42 узлов каждые 5 минут.
     Поэтому скорость оценивается по handshake-задержке как прокси-метрика:
     для тестового блока 256 КБ задержка >2000 мс соответствует
     <~1.5 Мбит/с. Порог отсева: задержка >2000 мс или рост задержки
@@ -522,47 +526,93 @@ async def collect_vpn(session: aiohttp.ClientSession):
     random.Random(42).shuffle(candidates)
     log.info("vpn candidates total (vless only, valid): %d from %d live sources", len(candidates), len(live_sources))
 
-    checked: list[tuple[int, float, str]] = []
-    for i in range(0, min(len(candidates), 2000), 50):
-        batch = candidates[i : i + 50]
-        results = await asyncio.gather(*[check_vpn_node(x) for x in batch])
-        for link, lat in zip(batch, results):
-            if lat is not None:
-                checked.append((vless_priority(link), lat, link))
-                baseline[link] = lat
-        await asyncio.sleep(0.2)
+    async def check_links(links: list[str]) -> list[tuple[int, float, str]]:
+        out: list[tuple[int, float, str]] = []
+        for i in range(0, len(links), 50):
+            batch = links[i : i + 50]
+            results = await asyncio.gather(*[check_vpn_node(x) for x in batch])
+            for link, lat in zip(batch, results):
+                if lat is not None:
+                    out.append((vless_priority(link), lat, link))
+                    baseline[link] = lat
+            await asyncio.sleep(0.2)
+        return out
+
+    async def group_by_country(checked_list):
+        hosts = []
+        for _, _, link in checked_list:
+            parsed = parse_host_port(link)
+            if parsed:
+                hosts.append(parsed[0])
+        unique_hosts = list(dict.fromkeys(hosts))
+        ip_by_host: dict[str, str] = {}
+        for host in unique_hosts:
+            ip = await asyncio.to_thread(resolve_ip, host)
+            if ip:
+                ip_by_host[host] = ip
+        ips = list(dict.fromkeys(ip_by_host.values()))
+        geo_by_ip = await geo_lookup(session, ips, geo_cache)
+        grouped: dict[str, list[tuple[int, float, str]]] = {}
+        dropped = 0
+        for prio, lat, link in checked_list:
+            parsed = parse_host_port(link)
+            if not parsed:
+                continue
+            ip = ip_by_host.get(parsed[0])
+            cc = geo_by_ip.get(ip) if ip else None
+            if not cc:
+                continue
+            if cc in BLACKLIST:
+                dropped += 1
+                continue
+            grouped.setdefault(cc, []).append((prio, lat, link))
+        return grouped, dropped
+
+    checked = await check_links(candidates[:2000])
     log.info("vpn checked ok: %d", len(checked))
-
-    hosts = []
-    link_to_ip: dict[str, str] = {}
-    for _, _, link in checked:
-        parsed = parse_host_port(link)
-        if parsed:
-            hosts.append(parsed[0])
-    unique_hosts = list(dict.fromkeys(hosts))
-    ip_by_host: dict[str, str] = {}
-    for host in unique_hosts:
-        ip = await asyncio.to_thread(resolve_ip, host)
-        if ip:
-            ip_by_host[host] = ip
-    ips = list(dict.fromkeys(ip_by_host.values()))
-    geo_by_ip = await geo_lookup(session, ips, geo_cache)
-
-    by_country: dict[str, list[tuple[int, float, str]]] = {}
-    dropped_blacklist = 0
-    for prio, lat, link in checked:
-        parsed = parse_host_port(link)
-        if not parsed:
-            continue
-        ip = ip_by_host.get(parsed[0])
-        cc = geo_by_ip.get(ip) if ip else None
-        if not cc:
-            continue
-        if cc in BLACKLIST:
-            dropped_blacklist += 1
-            continue
-        by_country.setdefault(cc, []).append((prio, lat, link))
+    by_country, dropped_blacklist = await group_by_country(checked)
     log.info("geo blacklist dropped: %d nodes", dropped_blacklist)
+    # Ровно 6 на страну: если после первого прохода какая-то основная
+    # страна не набрала 6, проверяем остальных кандидатов, пока не наберём
+    # или пока кандидаты не кончатся.
+    next_idx = 2000
+    while next_idx < len(candidates) and any(
+        len(by_country.get(cc, [])) < PER_COUNTRY for cc in MAIN_COUNTRIES
+    ):
+        extra = candidates[next_idx : next_idx + 500]
+        next_idx += len(extra)
+        log.info("country short, extra check pass: %d more candidates", len(extra))
+        checked2 = await check_links(extra)
+        log.info("vpn checked ok (extra pass): %d", len(checked2))
+        grouped2, dropped2 = await group_by_country(checked2)
+        dropped_blacklist += dropped2
+        for cc, grp in grouped2.items():
+            by_country.setdefault(cc, []).extend(grp)
+    # Фолбэк: если страна всё ещё не набрала 6 — добираем из прошлого пула
+    # (узлы, которые уже работали; монитор выкинет их, если они умерли).
+    prev_active = state.get("active", [])
+    for cc in MAIN_COUNTRIES:
+        if len(by_country.get(cc, [])) < PER_COUNTRY:
+            need = PER_COUNTRY - len(by_country.get(cc, []))
+            have = {t[2] for t in by_country.get(cc, [])}
+            prev_links = []
+            for old in prev_active:
+                occ, _ = parse_slot(old)
+                if occ != cc:
+                    continue
+                base = old.split("#", 1)[0]
+                if base in have or base in prev_links:
+                    continue
+                if validate_vless_link(base):
+                    continue
+                prev_links.append(base)
+            prev_links = prev_links[:need]
+            if prev_links:
+                log.info("country %s: fallback from previous pool: %d nodes", cc, len(prev_links))
+                checked3 = await check_links(prev_links)
+                grouped3, _ = await group_by_country(checked3)
+                for c2, grp in grouped3.items():
+                    by_country.setdefault(c2, []).extend(grp)
     for cc in by_country:
         by_country[cc].sort(key=lambda t: (-t[0], t[1]))
 
@@ -571,7 +621,7 @@ async def collect_vpn(session: aiohttp.ClientSession):
     renamed_baseline: dict[str, float] = {}
     layout: dict[str, int] = {}
     for cc in MAIN_COUNTRIES:
-        group = by_country.get(cc, [])
+        group = [t for t in by_country.get(cc, []) if t[2] not in used_links]
         take = group[:PER_COUNTRY]
         for idx, (prio, lat, link) in enumerate(take, start=1):
             renamed = rename_vless(link, cc, idx)
@@ -895,8 +945,9 @@ async def monitor_loop():
                 reserve = list(state.get("reserve", []))
                 results = await asyncio.gather(*[check_vpn_node(x) for x in active])
                 changed = False
-                dropped_slots: list[tuple[str, int]] = []
-                new_active: list[str] = []
+                # Слоты в исходном порядке: ('keep', link) или ('drop', cc, num).
+                # Замены вставляются на место выпавших слотов, порядок списка не ломается.
+                slots: list[tuple] = []
                 for link, lat in zip(active, results):
                     base = baseline.get(link, 0)
                     if lat is None:
@@ -905,36 +956,39 @@ async def monitor_loop():
                         if fails[link] >= 2:
                             log.info("monitor drop after 2 fails: %s", link[:60])
                             fails.pop(link, None)
-                            dropped_slots.append(parse_slot(link))
+                            slots.append(("drop",) + parse_slot(link))
                             changed = True
                             continue
-                        new_active.append(link)
+                        slots.append(("keep", link))
                     elif is_slow(lat, base):
                         slow[link] = slow.get(link, 0) + 1
                         fails[link] = 0
                         if slow[link] >= 2:
                             log.info("monitor drop after 2 slow (%.0fms, base %.0fms): %s", lat, base, link[:60])
                             slow.pop(link, None)
-                            dropped_slots.append(parse_slot(link))
+                            slots.append(("drop",) + parse_slot(link))
                             changed = True
                             continue
-                        new_active.append(link)
+                        slots.append(("keep", link))
                     else:
                         fails[link] = 0
                         slow[link] = 0
                         baseline[link] = lat
-                        new_active.append(link)
+                        slots.append(("keep", link))
+                new_active: list[str] = [s[1] for s in slots if s[0] == "keep"]
                 if changed and reserve:
                     # Замена с сохранением слота: для основной страны — узел той же
                     # страны, для редкой — узел из новой случайной страны
                     # (не из текущего набора редких), чтобы набор редких обновился сразу.
                     geo_cache = dict(state.get("geo", {}))
                     rare_now = list(state.get("rare_countries", []))
+                    replacements: dict[int, str] = {}
                     added = 0
                     async with aiohttp.ClientSession() as _sess:
-                        for slot_cc, slot_num in dropped_slots:
-                            if added >= len(dropped_slots):
-                                break
+                        for idx, slot in enumerate(slots):
+                            if slot[0] != "drop":
+                                continue
+                            _, slot_cc, slot_num = slot
                             is_rare_slot = slot_cc not in MAIN_COUNTRIES
                             for cand in list(reserve):
                                 cand_cc = await country_of_link(_sess, cand, geo_cache)
@@ -951,7 +1005,7 @@ async def monitor_loop():
                                 if lat is None or is_slow(lat, 0):
                                     continue
                                 renamed = rename_vless(cand, new_cc, new_num)
-                                new_active.append(renamed)
+                                replacements[idx] = renamed
                                 reserve.remove(cand)
                                 baseline[renamed] = lat
                                 added += 1
@@ -962,6 +1016,13 @@ async def monitor_loop():
                     state["rare_countries"] = rare_now
                     state["geo"] = geo_cache
                     log.info("monitor replaced %d nodes from reserve", added)
+                    # Собираем список заново в исходном порядке слотов.
+                    new_active = []
+                    for idx, slot in enumerate(slots):
+                        if slot[0] == "keep":
+                            new_active.append(slot[1])
+                        elif idx in replacements:
+                            new_active.append(replacements[idx])
                     state["active"] = new_active
                     state["fails"] = {k: v for k, v in fails.items() if k in new_active}
                     state["slow"] = {k: v for k, v in slow.items() if k in new_active}
