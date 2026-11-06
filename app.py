@@ -6,8 +6,12 @@
   - Динамический поиск через GitHub Search API, мёртвые источники отбрасываются.
   - Geo: страна узла определяется по IP (ip-api.com, кэш в state.json).
     Blacklist: RU, UA, CN, IR, BY, KZ, UZ, AM, AZ, KG, TJ, MD — полностью исключены.
-  - Порядок подписки строгий: DE 5, FI 5, PL 5, NL 5, SE 5, US 5,
-    затем 5 редких стран по 1 узлу. Имена: "🇩🇪 DE | Fast 01" и т.п.
+  - Порядок подписки строгий: DE 6, FI 6, PL 6, NL 6, SE 6, US 6,
+    затем 6 редких стран по 1 узлу (всего 42). Имена: "🇩🇪 DE | Fast 01" и т.п.
+  - Редкие страны — случайные, меняются ровно раз в сутки (seed = дата UTC,
+    хранится в state.json как rare_date/rare_countries). Если редкая страна
+    перестаёт отвечать (монитор, 2 проверки подряд), она заменяется на
+    другую случайную страну сразу, не дожидаясь суток.
   - Проверка: TCP + TLS/Reality handshake, таймаут 3 с.
   - Скорость: полноценный VLESS-туннель через Reality требует ядро Xray
     на каждый узел, что слишком тяжело для проверки 35 узлов каждые 5 минут.
@@ -29,6 +33,7 @@
 """
 import asyncio
 import base64
+import html
 import json
 import logging
 import os
@@ -66,8 +71,8 @@ SLOW_RATIO = 3.0
 
 BLACKLIST = {"RU", "UA", "CN", "IR", "BY", "KZ", "UZ", "AM", "AZ", "KG", "TJ", "MD"}
 MAIN_COUNTRIES = ["DE", "FI", "PL", "NL", "SE", "US"]
-PER_COUNTRY = 5
-RARE_COUNT = 5
+PER_COUNTRY = 6
+RARE_COUNT = 6
 
 FLAGS = {
     "DE": "🇩🇪", "FI": "🇫🇮", "PL": "🇵🇱", "NL": "🇳🇱", "SE": "🇸🇪", "US": "🇺🇸",
@@ -113,18 +118,68 @@ def b64_decode_safe(s: str) -> str:
         return ""
 
 
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def validate_vless_link(link: str) -> str | None:
+    """Проверка конфига VLESS перед добавлением в пул. Возвращает причину отсева или None.
+    Главная причина ошибки клиента 'reality.publicKey: need 32 bytes':
+    в исходных списках разделители бывают HTML-экранированы (&amp; вместо &),
+    из-за чего клиент не видит pbk/sni. Такие ссылки сначала чинятся через
+    html.unescape, а если pbk всё равно нет или он не 32 байта — узел выбрасывается.
+    """
+    try:
+        parsed = urlparse(link)
+        if parsed.scheme != "vless":
+            return "not vless"
+        uuid = parsed.username or ""
+        if not UUID_RE.match(uuid):
+            return "bad uuid"
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            return "no host/port"
+        from urllib.parse import parse_qs
+        q = parse_qs(parsed.query)
+        sec = (q.get("security", [""])[0] or "").lower()
+        if sec == "reality":
+            pbk = (q.get("pbk", [""])[0] or "").strip()
+            if not pbk:
+                return "reality without pbk"
+            # pbk — base64url от 32-байтового ключа (43 символа без '=')
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", pbk):
+                return "reality pbk bad chars"
+            padded = pbk + "=" * (-len(pbk) % 4)
+            try:
+                raw = base64.urlsafe_b64decode(padded)
+            except Exception:
+                return "reality pbk not base64"
+            if len(raw) != 32:
+                return f"reality pbk {len(raw)} bytes, need 32"
+            sni = (q.get("sni", [""])[0] or "").strip()
+            if not sni:
+                return "reality without sni"
+        elif sec == "tls":
+            sni = (q.get("sni", [""])[0] or "").strip()
+            if not sni and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
+                return "tls without sni on IP host"
+        return None
+    except Exception as e:
+        return f"parse error: {e}"
+
+
 def parse_vpn_links(text: str) -> list[str]:
-    """Только vless://."""
+    """Только vless://. HTML-сущности (&amp; и т.п.) раскодируются до парсинга."""
     out: list[str] = []
-    text = text.strip()
+    text = html.unescape(text.strip())
     if not text:
         return out
     if "://" not in text:
         decoded = b64_decode_safe(text)
         if decoded:
-            text = decoded
+            text = html.unescape(decoded)
     for line in text.splitlines():
-        line = line.strip()
+        line = html.unescape(line.strip())
         if not line:
             continue
         if line.startswith("vless://"):
@@ -132,7 +187,7 @@ def parse_vpn_links(text: str) -> list[str]:
         elif len(line) > 20 and "://" not in line:
             decoded = b64_decode_safe(line)
             if decoded.startswith("vless://"):
-                out.append(decoded.strip())
+                out.append(html.unescape(decoded.strip()))
     seen, uniq = set(), []
     for x in out:
         if x not in seen:
@@ -392,10 +447,12 @@ def load_state():
             data.setdefault("geo", {})
             data.setdefault("reserve", [])
             data.setdefault("monitor", {})
+            data.setdefault("rare_date", "")
+            data.setdefault("rare_countries", [])
             return data
     except Exception:
         pass
-    return {"active": [], "fails": {}, "slow": {}, "baseline": {}, "sources": {}, "geo": {}, "reserve": [], "monitor": {}}
+    return {"active": [], "fails": {}, "slow": {}, "baseline": {}, "sources": {}, "geo": {}, "reserve": [], "monitor": {}, "rare_date": "", "rare_countries": []}
 
 
 def save_state(state):
@@ -445,10 +502,25 @@ async def collect_vpn(session: aiohttp.ClientSession):
             seen.add(x)
             uniq.append(x)
     candidates = uniq
+    # Валидация конфигов: Reality без pbk/sni или с pbk не 32 байта —
+    # это именно та ошибка 'reality.publicKey: need 32 bytes' из клиента.
+    # Такие узлы выбрасываются до проверки, а не попадают в подписку.
+    from collections import Counter as _Counter
+    invalid_reasons: _Counter = _Counter()
+    valid_candidates: list[str] = []
+    for x in candidates:
+        reason = validate_vless_link(x)
+        if reason:
+            invalid_reasons[reason] += 1
+        else:
+            valid_candidates.append(x)
+    if invalid_reasons:
+        log.info("vpn config validation dropped %d: %s", sum(invalid_reasons.values()), dict(invalid_reasons))
+    candidates = valid_candidates
     # Перемешиваем с фиксированным seed: иначе первые 600 кандидатов
     # почти все из одних и тех же стран (DE/NL/US), а FI/PL/SE почти не попадают.
     random.Random(42).shuffle(candidates)
-    log.info("vpn candidates total (vless only): %d from %d live sources", len(candidates), len(live_sources))
+    log.info("vpn candidates total (vless only, valid): %d from %d live sources", len(candidates), len(live_sources))
 
     checked: list[tuple[int, float, str]] = []
     for i in range(0, min(len(candidates), 2000), 50):
@@ -509,18 +581,31 @@ async def collect_vpn(session: aiohttp.ClientSession):
         layout[cc] = len(take)
         if len(take) < PER_COUNTRY:
             log.warning("country %s: only %d nodes (need %d)", cc, len(take), PER_COUNTRY)
-    rare_countries = [cc for cc in sorted(by_country.keys())
-                      if cc not in MAIN_COUNTRIES and cc not in BLACKLIST]
-    rare_countries.sort(key=lambda cc: by_country[cc][0][1])
-    rare_picked = []
-    for cc in rare_countries[:RARE_COUNT]:
+    # Редкие страны — случайные, меняются ровно раз в сутки.
+    # Seed = дата UTC: в течение дня набор стабилен, на следующий день — новый.
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    saved_rare_date = state.get("rare_date")
+    saved_rare = [c for c in state.get("rare_countries", []) if c in by_country]
+    rare_pool = [cc for cc in sorted(by_country.keys())
+                 if cc not in MAIN_COUNTRIES and cc not in BLACKLIST]
+    if saved_rare_date == today and len(saved_rare) >= RARE_COUNT:
+        rare_picked = saved_rare[:RARE_COUNT]
+        log.info("rare countries kept for %s: %s", today, rare_picked)
+    else:
+        rng = random.Random(f"rare-{today}")
+        rng.shuffle(rare_pool)
+        rare_picked = rare_pool[:RARE_COUNT]
+        log.info("rare countries rotated for %s: %s", today, rare_picked)
+    for cc in rare_picked:
+        if cc not in by_country:
+            continue
         prio, lat, link = by_country[cc][0]
         renamed = rename_vless(link, cc, 1)
         final.append(renamed)
         renamed_baseline[renamed] = lat
         used_links.add(link)
-        rare_picked.append(cc)
     layout["rare"] = rare_picked
+    layout["rare_date"] = today
     log.info("vpn layout: %s rare=%s", layout, rare_picked)
 
     reserve: list[str] = []
@@ -541,6 +626,8 @@ async def collect_vpn(session: aiohttp.ClientSession):
         "reserve": reserve,
         "monitor": {},
         "layout": layout,
+        "rare_date": today,
+        "rare_countries": rare_picked,
     })
     log.info("vpn final pool: %d vless, layout=%s", len(final), layout)
     return final, layout
@@ -764,6 +851,32 @@ async def run_cycle():
             return {"vpn": len(vpn), "http": len(http_p), "socks5": len(socks_p), "layout": layout}
 
 
+SLOT_RE = re.compile(r"([A-Z]{2}) \| Fast (\d+)")
+
+
+def parse_slot(link: str) -> tuple[str, int]:
+    """Страна и номер слота из имени узла, например '🇩🇪 DE | Fast 01' -> ('DE', 1)."""
+    frag = link.split("#", 1)[1] if "#" in link else ""
+    m = SLOT_RE.search(frag)
+    if m:
+        return m.group(1), int(m.group(2))
+    return "", 0
+
+
+async def country_of_link(session: aiohttp.ClientSession, link: str, geo_cache: dict) -> str | None:
+    """Страна резервного узла по его хосту (DNS + geo-кэш / ip-api)."""
+    parsed = parse_host_port(link)
+    if not parsed:
+        return None
+    ip = await asyncio.to_thread(resolve_ip, parsed[0])
+    if not ip:
+        return None
+    if ip in geo_cache:
+        return geo_cache[ip]
+    geo = await geo_lookup(session, [ip], geo_cache)
+    return geo.get(ip)
+
+
 async def monitor_loop():
     """5-минутный мониторинг активного пула. Замена только после 2 неудач/медленных проверок."""
     log.info("monitor started, interval=%ss, slow_ms=%s", MONITOR_INTERVAL, SLOW_MS)
@@ -782,6 +895,7 @@ async def monitor_loop():
                 reserve = list(state.get("reserve", []))
                 results = await asyncio.gather(*[check_vpn_node(x) for x in active])
                 changed = False
+                dropped_slots: list[tuple[str, int]] = []
                 new_active: list[str] = []
                 for link, lat in zip(active, results):
                     base = baseline.get(link, 0)
@@ -791,6 +905,7 @@ async def monitor_loop():
                         if fails[link] >= 2:
                             log.info("monitor drop after 2 fails: %s", link[:60])
                             fails.pop(link, None)
+                            dropped_slots.append(parse_slot(link))
                             changed = True
                             continue
                         new_active.append(link)
@@ -800,6 +915,7 @@ async def monitor_loop():
                         if slow[link] >= 2:
                             log.info("monitor drop after 2 slow (%.0fms, base %.0fms): %s", lat, base, link[:60])
                             slow.pop(link, None)
+                            dropped_slots.append(parse_slot(link))
                             changed = True
                             continue
                         new_active.append(link)
@@ -809,17 +925,42 @@ async def monitor_loop():
                         baseline[link] = lat
                         new_active.append(link)
                 if changed and reserve:
-                    needed = len(active) - len(new_active)
+                    # Замена с сохранением слота: для основной страны — узел той же
+                    # страны, для редкой — узел из новой случайной страны
+                    # (не из текущего набора редких), чтобы набор редких обновился сразу.
+                    geo_cache = dict(state.get("geo", {}))
+                    rare_now = list(state.get("rare_countries", []))
                     added = 0
-                    for cand in list(reserve):
-                        if added >= needed:
-                            break
-                        lat = await check_vpn_node(cand)
-                        if lat is not None and not is_slow(lat, 0):
-                            new_active.append(cand)
-                            reserve.remove(cand)
-                            baseline[cand] = lat
-                            added += 1
+                    async with aiohttp.ClientSession() as _sess:
+                        for slot_cc, slot_num in dropped_slots:
+                            if added >= len(dropped_slots):
+                                break
+                            is_rare_slot = slot_cc not in MAIN_COUNTRIES
+                            for cand in list(reserve):
+                                cand_cc = await country_of_link(_sess, cand, geo_cache)
+                                if is_rare_slot:
+                                    if cand_cc is None or cand_cc in MAIN_COUNTRIES or cand_cc in rare_now:
+                                        continue
+                                    new_cc = cand_cc
+                                    new_num = 1
+                                else:
+                                    if cand_cc != slot_cc:
+                                        continue
+                                    new_cc, new_num = slot_cc, slot_num
+                                lat = await check_vpn_node(cand)
+                                if lat is None or is_slow(lat, 0):
+                                    continue
+                                renamed = rename_vless(cand, new_cc, new_num)
+                                new_active.append(renamed)
+                                reserve.remove(cand)
+                                baseline[renamed] = lat
+                                added += 1
+                                if is_rare_slot:
+                                    rare_now = [c for c in rare_now if c != slot_cc] + [new_cc]
+                                    log.info("monitor rare rotated: %s -> %s", slot_cc, new_cc)
+                                break
+                    state["rare_countries"] = rare_now
+                    state["geo"] = geo_cache
                     log.info("monitor replaced %d nodes from reserve", added)
                     state["active"] = new_active
                     state["fails"] = {k: v for k, v in fails.items() if k in new_active}
