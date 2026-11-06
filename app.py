@@ -6,22 +6,23 @@
   - Динамический поиск через GitHub Search API, мёртвые источники отбрасываются.
   - Geo: страна узла определяется по IP (ip-api.com, кэш в state.json).
     Blacklist: RU, UA, CN, IR, BY, KZ, UZ, AM, AZ, KG, TJ, MD — полностью исключены.
-  - Порядок подписки строгий: DE 6, FI 6, PL 6, NL 6, SE 6, US 6,
-    затем 6 редких стран по 1 узлу (всего 42). Имена: "🇩🇪 DE | Fast 01" и т.п.
+  - Порядок подписки строгий: FI 6, US 6, DE 6, PL 6,
+    затем 6 редких стран по 1 узлу (всего 30). Имена: "🇫🇮 FI | Fast 01" и т.п.
   - Ровно 6 на страну, не больше не меньше: если после первого прохода
     проверки какая-то страна не набрала 6, проверяются остальные кандидаты,
     а если и этого мало — добирается из прошлого пула (рабочие узлы той же
-    страны). Публикуется всегда полный набор 42 узла.
+    страны). Публикуется всегда полный набор 30 узлов.
   - Редкие страны — случайные, меняются ровно раз в сутки (seed = дата UTC,
     хранится в state.json как rare_date/rare_countries). Если редкая страна
     перестаёт отвечать (монитор, 2 проверки подряд), она заменяется на
     другую случайную страну сразу, не дожидаясь суток.
   - Проверка: TCP + TLS/Reality handshake, таймаут 3 с.
-  - Скорость: полноценный VLESS-туннель через Reality требует ядро Xray
-    на каждый узел, что слишком тяжело для проверки 42 узлов каждые 5 минут.
-    Поэтому скорость оценивается по handshake-задержке как прокси-метрика:
-    для тестового блока 256 КБ задержка >2000 мс соответствует
-    <~1.5 Мбит/с. Порог отсева: задержка >2000 мс или рост задержки
+  - Скорость: реальный замер через Xray-core — скачивание 2 МБ через
+    VLESS-туннель узла (speed.cloudflare.com), порог 5 Мбит/с: медленнее —
+    узел улетает и заменяется из резерва той же страны. Замер делается
+    при каждом полном цикле (раз в 30 минут) и разовой командой
+    --speed-check для текущего пула. 5-минутный мониторинг по-прежнему
+    ловит мёртвые узлы по handshake-задержке: задержка >2000 мс или рост
     в 3+ раза от базовой — 2 проверки подряд = медленный узел.
   - Sticky Pool + 5-минутный мониторинг: узел заменяется только после
     2 неудач подряд (таймаут/ошибка) или 2 медленных проверок подряд.
@@ -69,12 +70,19 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "foto-co-zvezdoy/readall")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
 # Порог медленного узла: задержка handshake >2000 мс
-# (≈ <1.5 Мбит/с для тестового блока 256 КБ) или рост в 3+ раза от базовой.
+# или рост в 3+ раза от базовой.
 SLOW_MS = 2000.0
 SLOW_RATIO = 3.0
 
+# Реальный замер скорости через Xray-core: скачивание 2 МБ через туннель.
+XRAY_BIN = os.environ.get("XRAY_BIN", "/opt/readall/xray/xray")
+SPEED_MIN_MBPS = float(os.environ.get("SPEED_MIN_MBPS", "5"))
+SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes=2000000"
+SPEED_TEST_TIMEOUT = 15
+SPEED_CONCURRENCY = 4
+
 BLACKLIST = {"RU", "UA", "CN", "IR", "BY", "KZ", "UZ", "AM", "AZ", "KG", "TJ", "MD"}
-MAIN_COUNTRIES = ["DE", "FI", "PL", "NL", "SE", "US"]
+MAIN_COUNTRIES = ["FI", "US", "DE", "PL"]
 PER_COUNTRY = 6
 RARE_COUNT = 6
 
@@ -146,6 +154,15 @@ def validate_vless_link(link: str) -> str | None:
         from urllib.parse import parse_qs
         q = parse_qs(parsed.query)
         sec = (q.get("security", [""])[0] or "").lower()
+        # Тип транспорта должен быть известным: в исходных списках бывает
+        # мусор вида type=tcp#... — клиент такое не понимает
+        # ('unsupported: network tcp#...') и узел не подключается.
+        net = (q.get("type", ["tcp"])[0] or "tcp").lower()
+        if net not in ("tcp", "raw", "ws", "grpc", "xhttp", "httpupgrade",
+                       "splithttp", "kcp", "quic", "http"):
+            return f"bad type: {net[:30]}"
+        if sec not in ("", "reality", "tls", "none"):
+            return f"bad security: {sec[:20]}"
         if sec == "reality":
             pbk = (q.get("pbk", [""])[0] or "").strip()
             if not pbk:
@@ -261,13 +278,158 @@ async def check_vpn_node(link: str):
 
 
 def is_slow(latency, baseline):
+    """Медленный узел для 5-минутного монитора. Узел считается медленным,
+    только если задержка одновременно выше 2000 мс И в 3+ раза выше его
+    обычной задержки. Раньше хватало одного условия — из-за этого монитор
+    съедал узлы с высоким базовым пингом (например, Финляндию: база
+    ~1500 мс, любой всплеск выше 2000 мс — и узел вылетал). Реальную
+    скорость теперь решает замер 5 Мбит/с в полном цикле."""
     if latency is None:
         return False
-    if latency > SLOW_MS:
-        return True
-    if baseline and baseline > 0 and latency > baseline * SLOW_RATIO:
-        return True
-    return False
+    if not baseline or baseline <= 0:
+        return latency > SLOW_MS
+    return latency > SLOW_MS and latency > baseline * SLOW_RATIO
+
+
+def parse_xray_node(link: str):
+    """Параметры VLESS-ссылки для конфига Xray. None — тип транспорта не поддерживается."""
+    try:
+        from urllib.parse import parse_qs
+        parsed = urlparse(link)
+        if parsed.scheme != "vless":
+            return None
+        q = parse_qs(parsed.query)
+        g = lambda k, d="": (q.get(k, [d])[0] or d)
+        net = (g("type", "tcp") or "tcp").lower()
+        # raw — это TCP в нотации VLESS-ссылок.
+        if net == "raw":
+            net = "tcp"
+        if net not in ("tcp", "ws", "grpc", "xhttp", "httpupgrade"):
+            return None
+        return {
+            "uuid": parsed.username, "host": parsed.hostname, "port": parsed.port,
+            "security": (g("security") or "").lower(), "pbk": g("pbk"), "sni": g("sni"),
+            "sid": g("sid"), "fp": g("fp", "chrome") or "chrome", "flow": g("flow"),
+            "type": net, "path": g("path", "/") or "/", "host_hdr": g("host", ""),
+            "service": g("serviceName", "") or "", "mode": g("mode", "auto") or "auto",
+        }
+    except Exception:
+        return None
+
+
+def xray_config_for(node: dict, port: int) -> dict:
+    if node["security"] == "reality":
+        stream = {"network": node["type"], "security": "reality",
+                  "realitySettings": {"serverName": node["sni"], "publicKey": node["pbk"],
+                                      "shortId": node["sid"], "fingerprint": node["fp"]}}
+    elif node["security"] == "tls":
+        stream = {"network": node["type"], "security": "tls",
+                  "tlsSettings": {"serverName": node["sni"], "fingerprint": node["fp"]}}
+    else:
+        stream = {"network": node["type"], "security": "none"}
+    if node["type"] == "ws":
+        stream["wsSettings"] = {"path": node["path"],
+                                "headers": {"Host": node["host_hdr"] or node["sni"] or node["host"]}}
+    elif node["type"] == "grpc":
+        stream["grpcSettings"] = {"serviceName": node["service"], "multiMode": False}
+    elif node["type"] == "xhttp":
+        stream["xhttpSettings"] = {"path": node["path"],
+                                   "host": node["host_hdr"] or node["sni"] or node["host"],
+                                   "mode": node["mode"]}
+    elif node["type"] == "httpupgrade":
+        stream["httpupgradeSettings"] = {"path": node["path"],
+                                         "host": node["host_hdr"] or node["sni"] or node["host"]}
+    user = {"id": node["uuid"], "encryption": "none"}
+    if node["flow"]:
+        user["flow"] = node["flow"]
+    return {"log": {"loglevel": "warning"},
+            "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "socks",
+                          "settings": {"auth": "noauth", "udp": False}}],
+            "outbounds": [{"protocol": "vless",
+                           "settings": {"vnext": [{"address": node["host"], "port": node["port"],
+                                                   "users": [user]}]},
+                           "streamSettings": stream}]}
+
+
+def _speed_test_sync(link: str, port: int):
+    """Синхронный замер скорости одного узла: Xray + curl.
+    Возвращает (Mbit/s, None) или (None, причина); причина 'skip' — тип
+    транспорта не тестируется, узел не трогаем."""
+    import subprocess
+    node = parse_xray_node(link)
+    if node is None:
+        return None, "skip"
+    # Xray не запускает VLESS без шифрования (security=none) на публичные IP —
+    # это ограничение тестера, а не медленный узел, поэтому такие узлы
+    # не трогаем: их судьбу решает монитор по handshake.
+    if node["security"] == "none":
+        return None, "skip"
+    cfg_path = f"/tmp/xray-speed-{port}.json"
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(xray_config_for(node, port), f)
+    except Exception as e:
+        return None, f"config write failed: {e}"
+    proc = subprocess.Popen([XRAY_BIN, "-config", cfg_path],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 5
+        ok = False
+        while time.time() < deadline:
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+                s.close()
+                ok = True
+                break
+            except OSError:
+                time.sleep(0.2)
+        if not ok:
+            return None, "xray did not listen"
+        r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
+                            "--socks5-hostname", f"127.0.0.1:{port}",
+                            "--max-time", str(SPEED_TEST_TIMEOUT), SPEED_TEST_URL],
+                           capture_output=True, text=True, timeout=SPEED_TEST_TIMEOUT + 5)
+        if r.returncode != 0:
+            return None, f"curl rc={r.returncode}"
+        try:
+            bps = float(r.stdout.strip() or 0)
+        except Exception:
+            return None, "bad curl output"
+        return bps * 8 / 1e6, None
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        try:
+            os.remove(cfg_path)
+        except OSError:
+            pass
+
+
+async def speed_test_node(link: str, port: int):
+    return await asyncio.to_thread(_speed_test_sync, link, port)
+
+
+async def speed_test_many(links: list[str]) -> dict:
+    """Замер скорости для списка ссылок (параллельно, до SPEED_CONCURRENCY).
+    При неудаче или скорости ниже порога — одна повторная попытка,
+    берётся лучший результат. Возвращает {link: (Mbit/s|None, причина|None)}."""
+    sem = asyncio.Semaphore(SPEED_CONCURRENCY)
+    results: dict = {}
+
+    async def one(idx: int, link: str):
+        async with sem:
+            mbps, err = await speed_test_node(link, 19100 + idx)
+            if err != "skip" and (mbps is None or mbps < SPEED_MIN_MBPS):
+                mbps2, err2 = await speed_test_node(link, 19100 + idx)
+                if mbps2 is not None and (mbps is None or mbps2 > mbps):
+                    mbps, err = mbps2, err2
+            results[link] = (mbps, err)
+
+    await asyncio.gather(*[one(i, l) for i, l in enumerate(links)])
+    return results
 
 
 async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
@@ -654,8 +816,79 @@ async def collect_vpn(session: aiohttp.ClientSession):
         final.append(renamed)
         renamed_baseline[renamed] = lat
         used_links.add(link)
-    layout["rare"] = rare_picked
     layout["rare_date"] = today
+    # Speed gate: реальный замер скорости каждого узла пула через Xray.
+    # Порог 5 Мбит/с: медленнее — узел улетает и заменяется из резерва
+    # той же страны (для редкой — из новой случайной страны).
+    reserve_by_country: dict[str, list[tuple[int, float, str]]] = {}
+    for cc, group in by_country.items():
+        rest = [t for t in group if t[2] not in used_links]
+        if rest:
+            reserve_by_country[cc] = sorted(rest, key=lambda t: (-t[0], t[1]))
+    speed_results = await speed_test_many([l.split("#", 1)[0] for l in final])
+    gated_final: list[str] = []
+    dropped_speed: list[tuple[str, float | None, str | None]] = []
+    replaced_speed = 0
+    for renamed in final:
+        base = renamed.split("#", 1)[0]
+        cc, num = parse_slot(renamed)
+        mbps, err = speed_results.get(base, (None, "no result"))
+        if err == "skip":
+            log.info("speed gate skip (untestable type): %s", renamed[:60])
+            gated_final.append(renamed)
+            continue
+        if mbps is not None and mbps >= SPEED_MIN_MBPS:
+            gated_final.append(renamed)
+            continue
+        dropped_speed.append((renamed, mbps, err))
+        replacement = None
+        if cc in MAIN_COUNTRIES:
+            cands = reserve_by_country.get(cc, [])
+            for attempt in range(3):
+                if not cands:
+                    break
+                _, _, cand = cands.pop(0)
+                mb2, err2 = await speed_test_node(cand, 19200 + replaced_speed * 7 + attempt)
+                if err2 == "skip":
+                    continue
+                if mb2 is not None and mb2 >= SPEED_MIN_MBPS:
+                    replacement = rename_vless(cand, cc, num)
+                    renamed_baseline[replacement] = baseline.get(cand, 0)
+                    used_links.add(cand)
+                    break
+        else:
+            avail = [c for c in reserve_by_country.keys()
+                     if c not in MAIN_COUNTRIES and c not in rare_picked]
+            random.Random().shuffle(avail)
+            for new_cc in avail:
+                cands = reserve_by_country.get(new_cc, [])
+                for attempt in range(3):
+                    if not cands:
+                        break
+                    _, _, cand = cands.pop(0)
+                    mb2, err2 = await speed_test_node(cand, 19200 + replaced_speed * 7 + attempt)
+                    if err2 == "skip":
+                        continue
+                    if mb2 is not None and mb2 >= SPEED_MIN_MBPS:
+                        replacement = rename_vless(cand, new_cc, 1)
+                        renamed_baseline[replacement] = baseline.get(cand, 0)
+                        used_links.add(cand)
+                        rare_picked = [new_cc if c == cc else c for c in rare_picked]
+                        break
+                if replacement:
+                    break
+        if replacement:
+            gated_final.append(replacement)
+            replaced_speed += 1
+        else:
+            log.warning("speed gate: no replacement for %s", renamed[:60])
+    final = gated_final
+    log.info("speed gate: tested %d, dropped %d, replaced %d",
+             len(speed_results), len(dropped_speed), replaced_speed)
+    for r, mbps, err in dropped_speed:
+        log.info("speed gate dropped: %s speed=%s err=%s",
+                 r[:60], f"{mbps:.2f} Mbit/s" if mbps else None, err)
+    layout["rare"] = rare_picked
     log.info("vpn layout: %s rare=%s", layout, rare_picked)
 
     reserve: list[str] = []
@@ -1045,6 +1278,89 @@ async def monitor_loop():
             log.exception("monitor failed: %s", e)
 
 
+async def speed_check_current():
+    """Разовая проверка текущего пула (--speed-check): реальный замер
+    скорости каждого узла, замена медленных (<5 Мбит/с) из резерва, публикация."""
+    state = load_state()
+    active = list(state.get("active", []))
+    reserve = list(state.get("reserve", []))
+    if not active:
+        log.info("speed-check: pool is empty")
+        return
+    geo_cache = dict(state.get("geo", {}))
+    rare_now = list(state.get("rare_countries", []))
+    baseline = dict(state.get("baseline", {}))
+    results = await speed_test_many([l.split("#", 1)[0] for l in active])
+    slots: list[tuple] = []
+    dropped = 0
+    for link in active:
+        base = link.split("#", 1)[0]
+        mbps, err = results.get(base, (None, "no result"))
+        if err == "skip":
+            log.info("speed-check skip (untestable type): %s", link[:60])
+            slots.append(("keep", link))
+        elif mbps is not None and mbps >= SPEED_MIN_MBPS:
+            log.info("speed-check ok: %s %.2f Mbit/s", link[:60], mbps)
+            slots.append(("keep", link))
+        else:
+            log.info("speed-check drop: %s speed=%s err=%s", link[:60],
+                     f"{mbps:.2f}" if mbps else None, err)
+            slots.append(("drop",) + parse_slot(link))
+            dropped += 1
+    replacements: dict[int, str] = {}
+    replaced = 0
+    if dropped and reserve:
+        async with aiohttp.ClientSession() as _sess:
+            for idx, slot in enumerate(slots):
+                if slot[0] != "drop":
+                    continue
+                _, slot_cc, slot_num = slot
+                is_rare_slot = slot_cc not in MAIN_COUNTRIES
+                for cand in list(reserve):
+                    cand_cc = await country_of_link(_sess, cand, geo_cache)
+                    if is_rare_slot:
+                        if cand_cc is None or cand_cc in MAIN_COUNTRIES or cand_cc in rare_now:
+                            continue
+                        new_cc, new_num = cand_cc, 1
+                    else:
+                        if cand_cc != slot_cc:
+                            continue
+                        new_cc, new_num = slot_cc, slot_num
+                    mb2, err2 = await speed_test_node(cand, 19300 + idx)
+                    if err2 == "skip":
+                        continue
+                    if mb2 is None or mb2 < SPEED_MIN_MBPS:
+                        continue
+                    renamed = rename_vless(cand, new_cc, new_num)
+                    replacements[idx] = renamed
+                    reserve.remove(cand)
+                    baseline[renamed] = 0
+                    replaced += 1
+                    if is_rare_slot:
+                        rare_now = [c for c in rare_now if c != slot_cc] + [new_cc]
+                        log.info("speed-check rare rotated: %s -> %s", slot_cc, new_cc)
+                    break
+    new_active: list[str] = []
+    for idx, slot in enumerate(slots):
+        if slot[0] == "keep":
+            new_active.append(slot[1])
+        elif idx in replacements:
+            new_active.append(replacements[idx])
+    state["active"] = new_active
+    state["reserve"] = reserve
+    state["rare_countries"] = rare_now
+    state["geo"] = geo_cache
+    state["baseline"] = {k: baseline.get(k, 0) for k in new_active}
+    state["fails"] = {}
+    state["slow"] = {}
+    save_state(state)
+    write_subscription(new_active)
+    async with aiohttp.ClientSession() as session:
+        await publish_all(session)
+    log.info("speed-check done: tested %d, dropped %d, replaced %d, pool %d",
+             len(active), dropped, replaced, len(new_active))
+
+
 async def main_loop():
     log.info("readall service started, interval=%ss, monitor=%ss, output=%s", INTERVAL, MONITOR_INTERVAL, OUTPUT_DIR)
     await asyncio.gather(run_cycle_loop(), monitor_loop())
@@ -1061,7 +1377,9 @@ async def run_cycle_loop():
 
 
 if __name__ == "__main__":
-    if "--once" in sys.argv:
+    if "--speed-check" in sys.argv:
+        asyncio.run(speed_check_current())
+    elif "--once" in sys.argv:
         asyncio.run(run_cycle())
     else:
         asyncio.run(main_loop())
