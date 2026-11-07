@@ -6,12 +6,12 @@
   - Динамический поиск через GitHub Search API, мёртвые источники отбрасываются.
   - Geo: страна узла определяется по IP (ip-api.com, кэш в state.json).
     Blacklist: RU, UA, CN, IR, BY, KZ, UZ, AM, AZ, KG, TJ, MD — полностью исключены.
-  - Порядок подписки строгий: NL 6, US 6, DE 6, PL 6,
-    затем 6 редких стран по 1 узлу (всего 30). Имена: "🇳🇱 NL | Fast 01" и т.п.
-  - Ровно 6 на страну, не больше не меньше: если после первого прохода
-    проверки какая-то страна не набрала 6, проверяются остальные кандидаты,
+  - Порядок подписки строгий: FI 4, US 4, DE 4, NL 4, PL 4,
+    затем 6 редких стран по 1 узлу (всего 26). Имена: "🇫🇮 FI | Fast 01" и т.п.
+  - Ровно 4 на страну, не больше не меньше: если после первого прохода
+    проверки какая-то страна не набрала 4, проверяются остальные кандидаты,
     а если и этого мало — добирается из прошлого пула (рабочие узлы той же
-    страны). Публикуется всегда полный набор 30 узлов.
+    страны). Публикуется всегда полный набор 26 узлов.
   - Редкие страны — случайные, меняются ровно раз в сутки (seed = дата UTC,
     хранится в state.json как rare_date/rare_countries). Если редкая страна
     перестаёт отвечать (монитор, 2 проверки подряд), она заменяется на
@@ -24,6 +24,11 @@
     --speed-check для текущего пула. 5-минутный мониторинг по-прежнему
     ловит мёртвые узлы по handshake-задержке: задержка >2000 мс или рост
     в 3+ раза от базовой — 2 проверки подряд = медленный узел.
+  - Репутация: строгий фильтр DNSBL (zen.spamhaus.org, bl.spamcop.net,
+    dnsbl.sorbs.net) + blocklist.de прямо перед сохранением в подписку.
+    Грязный IP (спам/ботнет/сканер/атаки) выбрасывается и заменяется
+    из резерва той же страны (замена тоже проверяется по репутации
+    и по скорости). Кэш репутации — сутки, в state.json.
   - Sticky Pool + 5-минутный мониторинг: узел заменяется только после
     2 неудач подряд (таймаут/ошибка) или 2 медленных проверок подряд.
     Замена — из резерва той же страны, если есть, иначе из любого резерва.
@@ -32,6 +37,8 @@
 Модуль 2: Прокси HTTP / SOCKS5
   - Geo-фильтр по тому же blacklist, сортировка по пингу (задержке проверки).
   - http_proxies.txt / socks5_proxies.txt, по одному ip:port на строку.
+  - Репутация: тот же фильтр, что и у VPN, — в списки попадают только
+    чистые прокси. Отдельных файлов вроде clean_proxies.txt не создаётся.
 
 Публикация: GITHUB_TOKEN из /opt/readall/.env, GitHub Contents API.
 Полный цикл — каждые 1800 с, мониторинг пула — каждые 300 с.
@@ -99,9 +106,21 @@ PROXY_SPEED_TIMEOUT = int(os.environ.get("PROXY_SPEED_TIMEOUT", "30"))
 PROXY_SPEED_CONCURRENCY = 25
 PROXY_PING_POOL = 400
 
+# Репутационный фильтр (DNSBL + агрессивные чёрные списки).
+# Строгий обязательный этап прямо перед сохранением в основные файлы:
+# грязный IP не попадает ни в subscription.txt, ни в списки прокси.
+# Отдельных файлов вроде clean_proxies.txt не создаётся.
+DNSBL_ZONES = ["zen.spamhaus.org", "bl.spamcop.net", "dnsbl.sorbs.net"]
+DNSBL_TIMEOUT = 5
+DNSBL_CONCURRENCY = 25
+REP_TTL = 86400  # кэш репутации в state.json живёт сутки
+REP_CACHE: dict[str, dict] = {}  # ip -> {"clean": bool, "reasons": [...], "ts": float}
+BLOCKLIST_API_URL = "https://api.blocklist.de/api.php?ip={ip}"
+BLOCKLIST_TIMEOUT = 10
+
 BLACKLIST = {"RU", "UA", "CN", "IR", "BY", "KZ", "UZ", "AM", "AZ", "KG", "TJ", "MD"}
-MAIN_COUNTRIES = ["NL", "US", "DE", "PL"]
-PER_COUNTRY = 6
+MAIN_COUNTRIES = ["FI", "US", "DE", "NL", "PL"]
+PER_COUNTRY = 4
 RARE_COUNT = 6
 
 FLAGS = {
@@ -545,6 +564,207 @@ def resolve_ip(host: str):
         return None
 
 
+_dnsbl_selftest_done = False
+
+
+def _dnsbl_lookup_sync(ip: str, zone: str):
+    """Блокирующий обратный DNS-запрос. Возвращает A-запись или None."""
+    try:
+        rev = ".".join(reversed(ip.split(".")))
+        return socket.gethostbyname(f"{rev}.{zone}")
+    except Exception:
+        return None
+
+
+async def _dnsbl_selftest():
+    """Разовая проверка: отвечает ли Spamhaus на тестовый IP.
+    Через публичные резолверы (8.8.8.8) Spamhaus не отвечает — тогда зона
+    фактически отключена, и это честно пишется в лог, а не молчится."""
+    global _dnsbl_selftest_done
+    if _dnsbl_selftest_done:
+        return
+    _dnsbl_selftest_done = True
+    try:
+        ans = await asyncio.wait_for(
+            asyncio.to_thread(_dnsbl_lookup_sync, "127.0.0.2", "zen.spamhaus.org"),
+            timeout=DNSBL_TIMEOUT,
+        )
+    except Exception:
+        ans = None
+    if ans == "127.0.0.2":
+        log.info("DNSBL self-test: zen.spamhaus.org отвечает")
+    else:
+        log.warning(
+            "DNSBL self-test: zen.spamhaus.org не отвечает на тестовый IP "
+            "(ответ %s) — резолвер VPS блокирует Spamhaus, зона отключена",
+            ans,
+        )
+
+
+async def dnsbl_check_ip(ip: str) -> list[str]:
+    """Зоны DNSBL, где числится IP. 127.255.255.x = отказ резолвера, не листинг."""
+    await _dnsbl_selftest()
+    sem = asyncio.Semaphore(DNSBL_CONCURRENCY)
+
+    async def _one(zone: str):
+        async with sem:
+            try:
+                ans = await asyncio.wait_for(
+                    asyncio.to_thread(_dnsbl_lookup_sync, ip, zone),
+                    timeout=DNSBL_TIMEOUT,
+                )
+            except Exception:
+                ans = None
+            return zone if (ans and ans.startswith("127.0.")) else None
+
+    results = await asyncio.gather(*[_one(z) for z in DNSBL_ZONES])
+    return [z for z in results if z]
+
+
+async def blocklist_check_ip(session: aiohttp.ClientSession, ip: str) -> int:
+    """Число атак по IP на blocklist.de. -1 = API недоступен (не считаем грязным)."""
+    try:
+        async with session.get(
+            BLOCKLIST_API_URL.format(ip=ip),
+            timeout=aiohttp.ClientTimeout(total=BLOCKLIST_TIMEOUT),
+        ) as r:
+            if r.status != 200:
+                return -1
+            text = await r.text()
+            m = re.search(r"attacks:\s*(\d+)", text)
+            return int(m.group(1)) if m else -1
+    except Exception:
+        return -1
+
+
+async def reputation_check_ip(session: aiohttp.ClientSession, ip: str) -> tuple[bool, list[str]]:
+    """Чистота IP: (clean, причины). Кэш в REP_CACHE на сутки (state.json)."""
+    now = time.time()
+    cached = REP_CACHE.get(ip)
+    if cached and now - cached.get("ts", 0) < REP_TTL:
+        return cached["clean"], list(cached.get("reasons", []))
+    reasons: list[str] = []
+    for zone in await dnsbl_check_ip(ip):
+        reasons.append(f"dnsbl:{zone}")
+    attacks = await blocklist_check_ip(session, ip)
+    if attacks > 0:
+        reasons.append(f"blocklist.de:attacks={attacks}")
+    clean = not reasons
+    REP_CACHE[ip] = {"clean": clean, "reasons": reasons, "ts": now}
+    return clean, reasons
+
+
+async def reputation_filter_proxies(session, items, name):
+    """Фильтр прокси: items — [(lat, 'ip:port')]. Возвращает (clean, dropped)."""
+    ips = list(dict.fromkeys(p.split(":")[0] for _, p in items))
+    sem = asyncio.Semaphore(DNSBL_CONCURRENCY)
+
+    async def _check(ip):
+        async with sem:
+            return ip, await reputation_check_ip(session, ip)
+
+    verdicts = dict(await asyncio.gather(*[_check(ip) for ip in ips]))
+    clean_items: list = []
+    dropped = 0
+    for lat, p in items:
+        ok, reasons = verdicts[p.split(":")[0]]
+        if ok:
+            clean_items.append((lat, p))
+        else:
+            dropped += 1
+            log.info("reputation dropped %s proxy %s: %s", name, p, ", ".join(reasons))
+    if dropped:
+        log.info("%s: reputation dropped=%d", name, dropped)
+    return clean_items, dropped
+
+
+async def reputation_gate_vpn(session, final, reserve_by_country, rare_picked,
+                              baseline, renamed_baseline, used_links):
+    """Репутационный фильтр пула VLESS. Возвращает (final, dropped, replaced, rare_picked).
+    Грязный узел выбрасывается; замена — из резерва той же страны, тоже
+    проверяется по репутации и по скорости (порог 5 Мбит/с)."""
+    sem = asyncio.Semaphore(DNSBL_CONCURRENCY)
+
+    async def _ip_of(link):
+        parsed = parse_host_port(link.split("#", 1)[0])
+        if not parsed:
+            return None
+        return await asyncio.to_thread(resolve_ip, parsed[0])
+
+    ips = await asyncio.gather(*[_ip_of(l) for l in final])
+
+    async def _rep(ip):
+        if not ip:
+            return (True, [])
+        async with sem:
+            return await reputation_check_ip(session, ip)
+
+    verdicts = await asyncio.gather(*[_rep(ip) for ip in ips])
+    new_final: list[str] = []
+    dropped = 0
+    replaced = 0
+    for renamed, ip, (clean, reasons) in zip(final, ips, verdicts):
+        if clean:
+            new_final.append(renamed)
+            continue
+        dropped += 1
+        cc, num = parse_slot(renamed)
+        log.info("reputation dropped vpn %s ip=%s: %s", renamed[:60], ip, ", ".join(reasons))
+        replacement = None
+        if cc in MAIN_COUNTRIES:
+            cands = reserve_by_country.get(cc, [])
+            for attempt in range(5):
+                if not cands:
+                    break
+                _, _, cand = cands.pop(0)
+                cand_ip = await _ip_of(cand)
+                if cand_ip:
+                    ok, _ = await reputation_check_ip(session, cand_ip)
+                    if not ok:
+                        continue
+                mb2, err2 = await speed_test_node(cand, 19300 + replaced * 7 + attempt)
+                if err2 == "skip":
+                    continue
+                if mb2 is not None and mb2 >= SPEED_MIN_MBPS:
+                    replacement = rename_vless(cand, cc, num)
+                    renamed_baseline[replacement] = baseline.get(cand, 0)
+                    used_links.add(cand)
+                    break
+        else:
+            avail = [c for c in reserve_by_country.keys()
+                     if c not in MAIN_COUNTRIES and c not in rare_picked]
+            random.Random().shuffle(avail)
+            for new_cc in avail:
+                cands = reserve_by_country.get(new_cc, [])
+                for attempt in range(5):
+                    if not cands:
+                        break
+                    _, _, cand = cands.pop(0)
+                    cand_ip = await _ip_of(cand)
+                    if cand_ip:
+                        ok, _ = await reputation_check_ip(session, cand_ip)
+                        if not ok:
+                            continue
+                    mb2, err2 = await speed_test_node(cand, 19300 + replaced * 7 + attempt)
+                    if err2 == "skip":
+                        continue
+                    if mb2 is not None and mb2 >= SPEED_MIN_MBPS:
+                        replacement = rename_vless(cand, new_cc, 1)
+                        renamed_baseline[replacement] = baseline.get(cand, 0)
+                        used_links.add(cand)
+                        rare_picked = [new_cc if c == cc else c for c in rare_picked]
+                        break
+                if replacement:
+                    break
+        if replacement:
+            new_final.append(replacement)
+            replaced += 1
+        else:
+            log.warning("reputation: no clean replacement for %s", renamed[:60])
+    log.info("reputation vpn: dropped=%d replaced=%d final=%d", dropped, replaced, len(new_final))
+    return new_final, dropped, replaced, rare_picked
+
+
 async def geo_lookup(session: aiohttp.ClientSession, ips: list[str], cache: dict) -> dict:
     """countryCode по IP через ip-api.com batch API, с кэшем. Возвращает {ip: cc}."""
     result = {}
@@ -752,7 +972,7 @@ async def collect_vpn(session: aiohttp.ClientSession):
     log.info("vpn checked ok: %d", len(checked))
     by_country, dropped_blacklist = await group_by_country(checked)
     log.info("geo blacklist dropped: %d nodes", dropped_blacklist)
-    # Ровно 6 на страну: если после первого прохода какая-то основная
+    # Ровно 4 на страну: если после первого прохода какая-то основная
     # страна не набрала 6, проверяем остальных кандидатов, пока не наберём
     # или пока кандидаты не кончатся.
     next_idx = 2000
@@ -906,6 +1126,11 @@ async def collect_vpn(session: aiohttp.ClientSession):
     for r, mbps, err in dropped_speed:
         log.info("speed gate dropped: %s speed=%s err=%s",
                  r[:60], f"{mbps:.2f} Mbit/s" if mbps else None, err)
+    # Репутационный фильтр — строгий, прямо перед сохранением в подписку.
+    final, rep_dropped, rep_replaced, rare_picked = await reputation_gate_vpn(
+        session, final, reserve_by_country, rare_picked,
+        baseline, renamed_baseline, used_links,
+    )
     layout["rare"] = rare_picked
     log.info("vpn layout: %s rare=%s", layout, rare_picked)
 
@@ -929,9 +1154,10 @@ async def collect_vpn(session: aiohttp.ClientSession):
         "layout": layout,
         "rare_date": today,
         "rare_countries": rare_picked,
+        "reputation": REP_CACHE,
     })
     log.info("vpn final pool: %d vless, layout=%s", len(final), layout)
-    return final, layout
+    return final, layout, {"dropped": rep_dropped, "replaced": rep_replaced}
 
 
 def parse_proxies(text: str) -> list[str]:
@@ -1108,7 +1334,8 @@ async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
         log.info("%s: ping ok=%d, blacklist dropped=%d", name, len(filtered), dropped)
         if speed_checker is None:
             log.warning("%s: speed test unavailable, keeping ping-only results", name)
-            return [p for _, p in filtered[:MAX_PROXY]]
+            filtered, rep_dropped = await reputation_filter_proxies(session, filtered, name)
+            return [p for _, p in filtered[:MAX_PROXY]], rep_dropped
         # Реальный замер скорости: скачивание 1 МБ через прокси.
         # Идём по пингу от быстрых к медленным, останавливаемся,
         # когда набрали MAX_PROXY прокси быстрее порога.
@@ -1135,22 +1362,25 @@ async def collect_proxies(session: aiohttp.ClientSession, geo_cache: dict):
                 break
         log.info("%s: speed tested=%d, fast(>=%.1f Mbit/s)=%d, slow dropped=%d",
                  name, tested, PROXY_SPEED_MIN_MBPS, len(fast), slow_dropped)
-        return [p for _, p in fast[:MAX_PROXY]]
+        # Репутационный фильтр: только чистые прокси попадают в список.
+        fast, rep_dropped = await reputation_filter_proxies(session, fast, name)
+        log.info("%s: reputation dropped=%d, final=%d", name, rep_dropped, len(fast))
+        return [p for _, p in fast[:MAX_PROXY]], rep_dropped
 
-    good_http = await check_and_sort(
+    good_http, rep_http = await check_and_sort(
         http_candidates,
         lambda p: check_http_proxy(session, p),
         lambda p: speed_test_http_proxy(session, p),
         "http",
     )
-    good_socks = await check_and_sort(
+    good_socks, rep_socks = await check_and_sort(
         socks_candidates,
         check_socks5_proxy,
         speed_test_socks5_proxy if HAS_SOCKS else None,
         "socks5",
     )
     log.info("proxies ok: http=%d socks5=%d", len(good_http), len(good_socks))
-    return good_http, good_socks, geo_cache
+    return good_http, good_socks, geo_cache, {"http": rep_http, "socks5": rep_socks}
 
 
 async def github_put_file(session: aiohttp.ClientSession, path: str, content: bytes, message: str):
@@ -1215,22 +1445,30 @@ def write_subscription(vpn: list[str]):
 
 
 async def run_cycle():
+    global REP_CACHE
     async with _lock:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        _st = load_state()
+        _now = time.time()
+        REP_CACHE = {k: v for k, v in _st.get("reputation", {}).items()
+                     if _now - v.get("ts", 0) < REP_TTL}
         async with aiohttp.ClientSession() as session:
-            vpn, layout = await collect_vpn(session)
+            vpn, layout, rep_vpn = await collect_vpn(session)
             write_subscription(vpn)
             state = load_state()
             geo_cache = dict(state.get("geo", {}))
-            http_p, socks_p, geo_cache = await collect_proxies(session, geo_cache)
+            http_p, socks_p, geo_cache, rep_px = await collect_proxies(session, geo_cache)
             (OUTPUT_DIR / "http_proxies.txt").write_text("\n".join(http_p) + "\n" if http_p else "")
             (OUTPUT_DIR / "socks5_proxies.txt").write_text("\n".join(socks_p) + "\n" if socks_p else "")
             log.info("wrote http_proxies.txt=%d socks5_proxies.txt=%d", len(http_p), len(socks_p))
             state = load_state()
             state["geo"] = geo_cache
+            state["reputation"] = REP_CACHE
             save_state(state)
             await publish_all(session)
-            return {"vpn": len(vpn), "http": len(http_p), "socks5": len(socks_p), "layout": layout}
+            return {"vpn": len(vpn), "http": len(http_p), "socks5": len(socks_p), "layout": layout,
+                    "rep_dropped": {"vpn": rep_vpn["dropped"], "vpn_replaced": rep_vpn["replaced"],
+                                    "http": rep_px["http"], "socks5": rep_px["socks5"]}}
 
 
 SLOT_RE = re.compile(r"([A-Z]{2}) \| Fast (\d+)")
@@ -1336,6 +1574,14 @@ async def monitor_loop():
                                 lat = await check_vpn_node(cand)
                                 if lat is None or is_slow(lat, 0):
                                     continue
+                                # Репутация: грязный узел не попадает в подписку и через монитор.
+                                cand_parsed = parse_host_port(cand)
+                                cand_ip = await asyncio.to_thread(resolve_ip, cand_parsed[0]) if cand_parsed else None
+                                if cand_ip:
+                                    ok, reasons = await reputation_check_ip(_sess, cand_ip)
+                                    if not ok:
+                                        log.info("monitor reputation skip %s ip=%s: %s", cand[:60], cand_ip, ", ".join(reasons))
+                                        continue
                                 renamed = rename_vless(cand, new_cc, new_num)
                                 replacements[idx] = renamed
                                 reserve.remove(cand)
