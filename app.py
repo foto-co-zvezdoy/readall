@@ -6,8 +6,8 @@
   - Динамический поиск через GitHub Search API, мёртвые источники отбрасываются.
   - Geo: страна узла определяется по IP (ip-api.com, кэш в state.json).
     Blacklist: RU, UA, CN, IR, BY, KZ, UZ, AM, AZ, KG, TJ, MD — полностью исключены.
-  - Порядок подписки строгий: FI 6, US 6, DE 6, PL 6,
-    затем 6 редких стран по 1 узлу (всего 30). Имена: "🇫🇮 FI | Fast 01" и т.п.
+  - Порядок подписки строгий: NL 6, US 6, DE 6, PL 6,
+    затем 6 редких стран по 1 узлу (всего 30). Имена: "🇳🇱 NL | Fast 01" и т.п.
   - Ровно 6 на страну, не больше не меньше: если после первого прохода
     проверки какая-то страна не набрала 6, проверяются остальные кандидаты,
     а если и этого мало — добирается из прошлого пула (рабочие узлы той же
@@ -100,7 +100,7 @@ PROXY_SPEED_CONCURRENCY = 25
 PROXY_PING_POOL = 400
 
 BLACKLIST = {"RU", "UA", "CN", "IR", "BY", "KZ", "UZ", "AM", "AZ", "KG", "TJ", "MD"}
-MAIN_COUNTRIES = ["FI", "US", "DE", "PL"]
+MAIN_COUNTRIES = ["NL", "US", "DE", "PL"]
 PER_COUNTRY = 6
 RARE_COUNT = 6
 
@@ -815,7 +815,7 @@ async def collect_vpn(session: aiohttp.ClientSession):
     # Seed = дата UTC: в течение дня набор стабилен, на следующий день — новый.
     today = time.strftime("%Y-%m-%d", time.gmtime())
     saved_rare_date = state.get("rare_date")
-    saved_rare = [c for c in state.get("rare_countries", []) if c in by_country]
+    saved_rare = [c for c in state.get("rare_countries", []) if c in by_country and c not in MAIN_COUNTRIES]
     rare_pool = [cc for cc in sorted(by_country.keys())
                  if cc not in MAIN_COUNTRIES and cc not in BLACKLIST]
     if saved_rare_date == today and len(saved_rare) >= RARE_COUNT:
